@@ -155,6 +155,19 @@ class TestBuildAnthropicClient:
                 "anthropic-beta": "interleaved-thinking-2025-05-14"
             }
 
+    def test_github_copilot_anthropic_endpoint_uses_bearer_auth(self):
+        # Copilot's /v1/messages endpoint rejects x-api-key and requires
+        # Authorization: Bearer <token>. The SDK builds the correct header
+        # only when constructed with auth_token=, not api_key=.
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "ghu_copilot-exchange-token-123",
+                base_url="https://api.githubcopilot.com",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["auth_token"] == "ghu_copilot-exchange-token-123"
+            assert "api_key" not in kwargs
+
 
 class TestReadClaudeCodeCredentials:
     @pytest.fixture(autouse=True)

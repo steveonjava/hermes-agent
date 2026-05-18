@@ -369,6 +369,71 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
+    def test_child_does_not_inherit_api_key_when_provider_differs(self):
+        # Regression: when delegation targets a different provider than the
+        # parent (e.g. parent=anthropic, child=copilot), the child must NOT
+        # inherit the parent's api_key — each provider has its own token
+        # format. Inheriting an Anthropic sk-ant-... into a Copilot child
+        # causes an immediate "Authorization header is badly formatted"
+        # rejection. effective_api_key must be cleared so init_agent re-resolves
+        # the right credential for the child's provider.
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "anthropic"
+        parent.api_key = "sk-ant-parent-key"
+        parent.base_url = "https://api.anthropic.com"
+        parent.api_mode = "anthropic_messages"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="cross-provider child",
+                context=None,
+                toolsets=None,
+                model="claude-sonnet-4-6",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="copilot",
+                override_base_url="https://api.githubcopilot.com",
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "copilot")
+            self.assertIsNone(
+                kwargs["api_key"],
+                "Child must not inherit parent's api_key across providers",
+            )
+
+    def test_child_inherits_api_key_when_provider_matches(self):
+        # Sibling guarantee: when the child stays on the parent's provider,
+        # the parent's api_key is still inherited (the original behavior).
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "anthropic"
+        parent.api_key = "sk-ant-parent-key"
+        parent.base_url = "https://api.anthropic.com"
+        parent.api_mode = "anthropic_messages"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="same-provider child",
+                context=None,
+                toolsets=None,
+                model="claude-opus-4-7",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["api_key"], "sk-ant-parent-key")
+
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
         sink = MagicMock()
@@ -946,6 +1011,23 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         }
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["api_mode"], "anthropic_messages")
+
+    def test_github_copilot_base_url_preserves_copilot_provider(self):
+        # When delegation.base_url points at api.githubcopilot.com, the
+        # provider must stay 'copilot' (not get rewritten to 'custom'), so
+        # agent_init.py can route Claude models to the anthropic_messages
+        # adapter and resolve a GitHub OAuth token from COPILOT_GITHUB_TOKEN.
+        # api_mode is intentionally None — derived later from model name.
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "claude-sonnet-4-6",
+            "provider": "copilot",
+            "base_url": "https://api.githubcopilot.com",
+        }
+        creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["provider"], "copilot")
+        self.assertEqual(creds["base_url"], "https://api.githubcopilot.com")
+        self.assertIsNone(creds["api_mode"])
 
     def test_direct_endpoint_returns_none_api_key_when_not_configured(self):
         # When base_url is set without api_key, api_key should be None so
