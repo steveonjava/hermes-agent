@@ -1021,13 +1021,24 @@ def _build_child_agent(
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
     effective_base_url = override_base_url or parent_agent.base_url
-    effective_api_key = override_api_key or parent_api_key
+    # Bug: api_key must NOT be inherited when the child targets a different provider.
+    # Each provider has its own token format — passing e.g. an Anthropic sk-ant-...
+    # key to a Copilot child (which expects a ghu_/gho_ GitHub OAuth token) causes
+    # an immediate "Authorization header is badly formatted" rejection before any
+    # tokens flow.  When the provider changes, let the child resolve its own key
+    # from env (same logic that already applies to api_mode via PR #20563).
+    _parent_provider = getattr(parent_agent, "provider", None) or ""
+    if override_api_key:
+        effective_api_key = override_api_key
+    elif effective_provider and effective_provider != _parent_provider:
+        effective_api_key = None  # let child resolve from env for its own provider
+    else:
+        effective_api_key = parent_api_key
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
     # Inheriting the parent's mode causes 404 errors when the child routes to the
     # wrong endpoint.  Derive the mode from the target provider when it differs.
-    _parent_provider = getattr(parent_agent, "provider", None) or ""
     if override_api_mode is not None:
         effective_api_mode = override_api_mode
     elif effective_provider != _parent_provider:
@@ -2398,6 +2409,12 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         elif base_url_hostname(configured_base_url) == "api.anthropic.com":
             provider = "anthropic"
             api_mode = "anthropic_messages"
+        elif base_url_hostname(configured_base_url) == "api.githubcopilot.com":
+            # Preserve the copilot provider name so agent_init.py can route
+            # Claude models to anthropic_messages and resolve the token correctly.
+            provider = "copilot"
+            # api_mode derived later in agent_init from model name (claude- → anthropic_messages)
+            api_mode = None
         elif "api.kimi.com/coding" in base_lower:
             provider = "custom"
             api_mode = "anthropic_messages"

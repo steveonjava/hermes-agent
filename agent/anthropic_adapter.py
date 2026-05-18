@@ -478,6 +478,10 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     if not normalized:
         return False
     normalized = normalized.rstrip("/").lower()
+    # GitHub Copilot's /v1/messages endpoint also requires Bearer auth —
+    # it does not accept Anthropic's native x-api-key header.
+    if base_url_host_matches(normalized, "api.githubcopilot.com"):
+        return True
     return normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
 
 

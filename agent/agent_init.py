@@ -247,6 +247,25 @@ def init_agent(
         # use a URL convention ending in /anthropic. Auto-detect these so the
         # Anthropic Messages API adapter is used instead of chat completions.
         agent.api_mode = "anthropic_messages"
+    elif agent.provider == "copilot":
+        # Copilot routes Claude models through the Anthropic Messages API
+        # (/v1/messages) and GPT-5+ through the Responses API.  When api_mode
+        # is not explicitly supplied (e.g. subagents where delegate_tool.py
+        # clears it for re-derivation), derive the mode from the model name
+        # directly — copilot_model_api_mode() needs a live API key to fetch
+        # the catalog and falls back to chat_completions without one, which
+        # breaks Claude subagents.  The pattern check is stable and matches
+        # the same logic copilot_model_api_mode() applies for catalog entries
+        # that only support /v1/messages (line 3008 in hermes_cli/models.py).
+        _copilot_model = (agent.model or "").lower()
+        if _copilot_model.startswith("claude-") or "/claude-" in _copilot_model:
+            agent.api_mode = "anthropic_messages"
+        else:
+            try:
+                from hermes_cli.models import copilot_model_api_mode
+                agent.api_mode = copilot_model_api_mode(agent.model)
+            except Exception:
+                agent.api_mode = "chat_completions"
     elif agent.provider == "bedrock" or (
         agent._base_url_hostname.startswith("bedrock-runtime.")
         and base_url_host_matches(agent._base_url_lower, "amazonaws.com")
@@ -541,7 +560,23 @@ def init_agent(
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
             # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
             _is_native_anthropic = agent.provider == "anthropic"
-            effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
+            _is_copilot = agent.provider == "copilot"
+            if _is_native_anthropic:
+                effective_key = api_key or resolve_anthropic_token() or ""
+            elif _is_copilot and not api_key:
+                # Copilot routes Claude models through anthropic_messages but uses a
+                # GitHub OAuth token (ghu_/gho_), not an Anthropic key.  When no key
+                # is supplied (e.g. subagents built by _build_child_agent that cleared
+                # the parent's mismatched key), resolve from COPILOT_GITHUB_TOKEN and
+                # exchange it for the short-lived API token.
+                try:
+                    from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
+                    _raw_copilot_token, _ = resolve_copilot_token()
+                    effective_key = get_copilot_api_token(_raw_copilot_token) if _raw_copilot_token else ""
+                except Exception:
+                    effective_key = ""
+            else:
+                effective_key = api_key or ""
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = base_url
