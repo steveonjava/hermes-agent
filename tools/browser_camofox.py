@@ -82,8 +82,16 @@ def _get_command_timeout() -> int:
 
 
 def _auth_headers() -> Dict[str, str]:
-    """Return Authorization header when CAMOFOX_API_KEY is set."""
-    key = (get_secret("CAMOFOX_API_KEY", "") or "").strip()
+    """Return Authorization header for camofox requests.
+
+    Prefers CAMOFOX_ACCESS_KEY (production container with auth enabled, where
+    every route except /health requires Authorization: Bearer ***, falling
+    back to CAMOFOX_API_KEY. Deployments that set only CAMOFOX_API_KEY are
+    unaffected.
+    """
+    key = (get_secret("CAMOFOX_ACCESS_KEY", "") or "").strip() or (
+        get_secret("CAMOFOX_API_KEY", "") or ""
+    ).strip()
     if key:
         return {"Authorization": f"Bearer {key}"}
     return {}
