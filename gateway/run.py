@@ -4801,6 +4801,38 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
+        # Gate: only run the notifier on the gateway designated as dispatcher.
+        # `kanban.notifier_in_gateway` defaults to `kanban.dispatch_in_gateway`
+        # (itself default True). Non-dispatching gateways exit here so they
+        # open zero SQLite connections to board files they don't own.
+        # Mirrors the dispatcher gate in `_kanban_dispatcher_watcher`.
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            logger.warning("kanban notifier: config loader unavailable; notifier disabled")
+            return
+        _env_notifier = os.environ.get("HERMES_KANBAN_NOTIFIER_IN_GATEWAY", "").strip().lower()
+        if _env_notifier in {"0", "false", "no", "off"}:
+            logger.info("[notifier-watcher] disabled via HERMES_KANBAN_NOTIFIER_IN_GATEWAY env")
+            return
+        try:
+            _notifier_full_cfg = _load_config()
+        except Exception as exc:
+            logger.warning("kanban notifier: cannot load config (%s); notifier disabled", exc)
+            return
+        _kanban_notifier_cfg = (
+            _notifier_full_cfg.get("kanban", {})
+            if isinstance(_notifier_full_cfg, dict)
+            else {}
+        )
+        _dispatch_default = _kanban_notifier_cfg.get("dispatch_in_gateway", True)
+        if not _kanban_notifier_cfg.get("notifier_in_gateway", _dispatch_default):
+            logger.info(
+                "[notifier-watcher] skipping all boards: not the designated dispatcher"
+                " (kanban.notifier_in_gateway=false)"
+            )
+            return
+
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal

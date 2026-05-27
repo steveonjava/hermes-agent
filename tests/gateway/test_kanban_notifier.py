@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -234,3 +235,106 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
     assert "crashed" in adapter.sent[1]["text"].lower()
+
+
+def _make_config(notifier_in_gateway=None, dispatch_in_gateway=True):
+    """Return a minimal config dict for notifier-scoping tests."""
+    kanban_cfg = {"dispatch_in_gateway": dispatch_in_gateway}
+    if notifier_in_gateway is not None:
+        kanban_cfg["notifier_in_gateway"] = notifier_in_gateway
+    return {"kanban": kanban_cfg}
+
+
+def test_notifier_skips_when_notifier_in_gateway_false(tmp_path, monkeypatch):
+    """Non-dispatching gateway opens zero SQLite connections.
+
+    When kanban.notifier_in_gateway=false the watcher must return before
+    touching any board DB, so non-dispatching gateways don't hold extra
+    SQLite readers open.
+    """
+    db_path = tmp_path / "scoping-test.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = None
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="scoping task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-scope")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    cfg = _make_config(notifier_in_gateway=False, dispatch_in_gateway=True)
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    # The watcher exited before opening board connections, so no messages sent.
+    assert adapter.sent == [], (
+        "Non-dispatching gateway must not deliver any notifications "
+        f"(got {adapter.sent})"
+    )
+
+
+def test_notifier_runs_when_notifier_in_gateway_true(tmp_path, monkeypatch):
+    """Dispatching gateway delivers notifications normally.
+
+    When kanban.notifier_in_gateway=true (the default) the watcher proceeds
+    as usual and delivers terminal events.
+    """
+    db_path = tmp_path / "scoping-dispatching.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="notify me", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-scope2")
+        kb.complete_task(conn, tid, summary="all good")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    cfg = _make_config(notifier_in_gateway=True, dispatch_in_gateway=True)
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "notify me" in adapter.sent[0]["text"]
+
+
+def test_notifier_defaults_to_dispatch_in_gateway_when_key_absent(tmp_path, monkeypatch):
+    """notifier_in_gateway absent => inherits dispatch_in_gateway.
+
+    When notifier_in_gateway is not set, the gate falls back to
+    dispatch_in_gateway. A gateway with dispatch_in_gateway=false therefore
+    also skips the notifier.
+    """
+    db_path = tmp_path / "scoping-inherit.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="inherit test", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-inherit")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    # notifier_in_gateway absent; dispatch_in_gateway=False => notifier skips.
+    cfg = _make_config(notifier_in_gateway=None, dispatch_in_gateway=False)
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    assert adapter.sent == [], (
+        "When dispatch_in_gateway=false and notifier_in_gateway not set, "
+        "notifier should also be skipped"
+    )
