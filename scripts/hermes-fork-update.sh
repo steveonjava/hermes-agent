@@ -271,6 +271,16 @@ else
   c_ok "no dependency changes"
 fi
 
+# --- 8b. Restore the gh draft-guard shim ----------------------------------
+# Defense-in-depth: all pipeline PRs must open as drafts. The guard lives in
+# the venv bin ahead of the real gh; reinstall it every update in case the
+# venv bin was rebuilt. Idempotent + self-skipping when no venv.
+if [[ -x "$PROJECT_ROOT/scripts/install-gh-draft-guard.sh" ]]; then
+  c_step "Restoring gh draft-guard shim"
+  bash "$PROJECT_ROOT/scripts/install-gh-draft-guard.sh" || \
+    c_warn "gh draft-guard install hit issues (see above)"
+fi
+
 # --- 9. Restart hermes services -------------------------------------------
 restart_service_graceful() {
   # $1 = scope ("user" or "system"), $2 = unit name (without .service)
