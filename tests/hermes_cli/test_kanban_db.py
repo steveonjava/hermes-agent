@@ -515,6 +515,284 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+def test_respawn_guard_blocker_auth_on_authentication_error(kanban_home):
+    """Full word 'Authentication' triggers blocker_auth (regex covers auth\\w*)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="authn-task", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("Authentication failed: invalid credentials", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "blocker_auth"
+
+
+def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
+    """Full word 'authorization' triggers blocker_auth (regex covers auth\\w*)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="authz-task", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("authorization denied for scope repo", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "blocker_auth"
+
+
+def test_respawn_guard_recent_success(kanban_home):
+    """A completed run within the guard window triggers recent_success."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="already-done", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "recent_success"
+
+
+def test_respawn_guard_stale_success_not_guarded(kanban_home):
+    """A completed run outside the guard window does not block re-spawn."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="old-done", assignee="alice")
+        old_end = int(time.time()) - kb._RESPAWN_GUARD_SUCCESS_WINDOW - 60
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, old_end - 300, old_end),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_in_comment(kanban_home, monkeypatch):
+    """A published (non-draft) PR URL in a recent comment triggers active_pr."""
+    monkeypatch.setattr(kb, "_pr_is_draft", lambda url: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_draft_pr_not_guarded(kanban_home, monkeypatch):
+    """A *draft* PR URL does NOT block respawn — the pipeline may extend it."""
+    monkeypatch.setattr(kb, "_pr_is_draft", lambda url: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="draft-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Draft PR: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_undeterminable_pr_fails_safe(kanban_home, monkeypatch):
+    """Undeterminable PR state (None) fails safe to blocking respawn."""
+    monkeypatch.setattr(kb, "_pr_is_draft", lambda url: None)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unknown-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_blocks_if_any_pr_nondraft(kanban_home, monkeypatch):
+    """With multiple PR URLs, a single non-draft blocks even if others are draft."""
+    def fake(url):
+        return "/pull/1" in url  # #1 draft, #2 published
+    monkeypatch.setattr(kb, "_pr_is_draft", fake)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="multi-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Draft https://github.com/o/r/pull/1 and "
+            "published https://github.com/o/r/pull/2",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_old_pr_comment_not_guarded(kanban_home, monkeypatch):
+    """A GitHub PR URL in a comment older than the PR window does not block."""
+    # Even a published PR: if the comment predates the window, it's not consulted.
+    monkeypatch.setattr(kb, "_pr_is_draft", lambda url: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="old-pr", assignee="alice")
+        old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/10', ?)",
+            (t, old_ts),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once defers (does NOT auto-block) a ready task whose last
+    error is a blocker_auth.
+
+    The old behaviour auto-blocked on first occurrence, which was too
+    aggressive: a transient 429 rate-limit (which typically clears in
+    seconds to minutes) would end up requiring manual unblock. The new
+    behaviour defers the spawn this tick; the task stays in ``ready``
+    and gets another chance next tick. If the auth error genuinely
+    persists, the existing ``consecutive_failures`` circuit breaker
+    will auto-block via the normal failure-limit path.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="quota-storm", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("rate limit exceeded: 429 Too Many Requests", t),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    # Critical: task is NOT auto-blocked on first occurrence.
+    assert t not in res.auto_blocked, (
+        f"blocker_auth should defer, not auto-block on first occurrence; "
+        f"got auto_blocked={res.auto_blocked!r}"
+    )
+    # It IS recorded as respawn_guarded with the reason.
+    assert (t, "blocker_auth") in res.respawn_guarded, (
+        f"expected (task_id, 'blocker_auth') in respawn_guarded; "
+        f"got {res.respawn_guarded!r}"
+    )
+    # And it's NOT spawned this tick.
+    assert t not in spawned_ids
+    # Status stays ``ready`` so a future tick (or operator action) can
+    # retry without manual unblock.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_skips_recent_success(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once skips (but does not block) a task with a recent completed run."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="recent-winner", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 300, now - 60),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "recent_success") in res.respawn_guarded
+    assert t not in spawned_ids
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"  # not blocked, just skipped
+
+
+def test_dispatch_respawn_guard_skips_active_pr(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """dispatch_once skips (but does not block) a task with a published PR comment."""
+    monkeypatch.setattr(kb, "_pr_is_draft", lambda url: False)
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_dry_run_no_auto_block(
+    kanban_home, all_assignees_spawnable
+):
+    """In dry_run mode, blocker_auth tasks are recorded in respawn_guarded (not auto-blocked)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="dry-quota", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("quota exceeded", t),
+        )
+        res = kb.dispatch_once(conn, dry_run=True)
+
+    assert (t, "blocker_auth") in res.respawn_guarded
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"  # dry_run: no writes
+
+
+def test_dispatch_respawn_guard_allows_clean_task(
+    kanban_home, all_assignees_spawnable
+):
+    """A task with no guard triggers is spawned normally."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="clean-task", assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids
+    assert not res.respawn_guarded
+    assert t not in res.auto_blocked
+
+
+def test_dispatch_respawn_guard_emits_event_for_skipped_task(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once emits a respawn_guarded task_event so operators can diagnose stuck-ready tasks."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="event-check", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 300, now - 60),
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events = kb.list_events(conn, t)
+
+    kinds = [e.kind for e in events]
+    assert "respawn_guarded" in kinds
+    guarded_evt = next(e for e in events if e.kind == "respawn_guarded")
+    # Event.payload is already parsed as a dict by list_events.
+    assert isinstance(guarded_evt.payload, dict)
+    assert guarded_evt.payload.get("reason") == "recent_success"
+
 
 # ---------------------------------------------------------------------------
 # Workspace resolution

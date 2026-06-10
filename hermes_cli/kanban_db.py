@@ -7645,6 +7645,78 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --- Draft-aware PR state for the respawn guard ---------------------------
+# Policy: a *draft* PR is unfinished work the pipeline MAY extend (don't
+# block respawn); a *published* PR is under review and off-limits to
+# auto-workers (block respawn). We resolve draft state LIVE at guard time
+# rather than trusting a cached card flag, because a PR can transition
+# draft -> published in GitHub after any flag was written — the guard must
+# decide on current ground truth, not a stale read.
+_PR_DRAFT_CACHE_TTL_SECONDS = 45        # ~one dispatcher tick; bounds gh calls
+_PR_DRAFT_QUERY_TIMEOUT_SECONDS = 6     # hard cap so the dispatch loop never hangs
+_pr_draft_cache: "dict[str, tuple[bool, float]]" = {}
+# Capturing variant of the PR-URL pattern: owner / repo / number.
+_PR_URL_PARTS_RE = re.compile(
+    r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<num>\d+)",
+    re.IGNORECASE,
+)
+
+
+def _pr_is_draft(url: str) -> Optional[bool]:
+    """Return True if the PR at ``url`` is a draft, False if published,
+    None if it cannot be determined (URL parse / gh missing / non-zero /
+    timeout / unexpected output).
+
+    Successful verdicts are cached for a short TTL so repeated dispatcher
+    ticks don't re-query GitHub for the same PR every tick. Failures are
+    NOT cached — the next tick retries — so a transient ``gh`` hiccup never
+    pins a stale verdict. Callers treat None as "block" (fail safe): we'd
+    rather defer a spawn for one tick than risk touching a published PR or
+    opening a duplicate.
+    """
+    m = _PR_URL_PARTS_RE.search(url or "")
+    if not m:
+        return None
+    owner, repo, num = m.group("owner"), m.group("repo"), m.group("num")
+    key = f"{owner}/{repo}#{num}".lower()
+
+    now = time.time()
+    cached = _pr_draft_cache.get(key)
+    if cached is not None and (now - cached[1]) < _PR_DRAFT_CACHE_TTL_SECONDS:
+        return cached[0]
+
+    gh = shutil.which("gh")
+    if not gh:
+        return None
+    try:
+        proc = subprocess.run(
+            [gh, "pr", "view", num, "--repo", f"{owner}/{repo}",
+             "--json", "isDraft", "-q", ".isDraft"],
+            capture_output=True, text=True,
+            timeout=_PR_DRAFT_QUERY_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip().lower()
+    if out == "true":
+        val = True
+    elif out == "false":
+        val = False
+    else:
+        return None
+
+    _pr_draft_cache[key] = (val, now)
+    # Bound cache growth: purge expired entries when it gets large.
+    if len(_pr_draft_cache) > 256:
+        for k in [
+            k for k, (_, ts) in _pr_draft_cache.items()
+            if (now - ts) >= _PR_DRAFT_CACHE_TTL_SECONDS
+        ]:
+            _pr_draft_cache.pop(k, None)
+    return val
+
 
 @dataclass
 class DispatchResult:
@@ -9124,12 +9196,25 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # Policy: a *draft* PR is unfinished work the pipeline may extend, so it
+    # does NOT block respawn. A *published* PR is under review and off-limits
+    # to auto-workers, so it DOES block. State is resolved live (``_pr_is_draft``)
+    # so a draft -> published transition in GitHub takes effect immediately
+    # rather than waiting on a cached flag. Undeterminable state fails safe to
+    # blocking: better to defer one tick than touch a published PR or open a
+    # duplicate. With multiple PR URLs, the guard blocks if ANY is non-draft.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    seen_urls: set[str] = set()
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        body = c["body"] or ""
+        for mt in _RESPAWN_GUARD_PR_URL_RE.finditer(body):
+            seen_urls.add(mt.group(0))
+    for url in seen_urls:
+        if _pr_is_draft(url) is not True:
+            # published or undeterminable -> keep blocking respawn
             return "active_pr"
 
     return None
