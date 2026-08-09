@@ -22,6 +22,11 @@
 #   9. Reinstall deps IF pyproject.toml / uv.lock / requirements changed.
 #  10. Restart all running hermes-gateway* + hermes-cron-* services
 #      (graceful SIGUSR1 drain → fallback to systemctl restart).
+#      Self-aware: if this script is running INSIDE a hermes unit (e.g. driven
+#      from an agent session), that unit is skipped in the main loop and
+#      restarted LAST via a detached systemd-run timer (+8s), so restarting
+#      our own gateway can't SIGTERM the script and leave the remaining
+#      services silently running stale pre-upgrade code.
 #  11. Optional push to fork.
 #
 # Usage:
@@ -283,6 +288,55 @@ if [[ -x "$PROJECT_ROOT/scripts/install-gh-draft-guard.sh" ]]; then
 fi
 
 # --- 9. Restart hermes services -------------------------------------------
+# Which unit is THIS script running inside? If the update is driven from a
+# Hermes session (agent terminal tool), the script lives in the cgroup of its
+# own gateway unit. Restarting that unit kills the script mid-flight (SIGTERM
+# → exit 130), so every service after it in the loop silently keeps running
+# STALE pre-upgrade code while new code sits on disk. Seen in the wild
+# 2026-08-08: 7 of 8 services were left on Jul-25/Aug-05 processes for ~11h.
+# Fix: identify our own unit, restart it LAST, and hand that final restart to
+# a detached systemd-run unit so this script survives to finish phase 10-11.
+SELF_UNIT=""
+if [[ -r /proc/self/cgroup ]]; then
+  SELF_UNIT="$(awk -F/ '{for(i=1;i<=NF;i++) if ($i ~ /^hermes-.*\.service$/) u=$i} END{if(u) print u}' \
+    /proc/self/cgroup 2>/dev/null | sed 's/\.service$//')"
+fi
+
+restart_self_detached() {
+  # $1 = unit name (without .service). Restarts our OWN unit from outside the
+  # script's process tree so being SIGTERMed doesn't abort the update.
+  local svc="$1"
+  echo "  → $svc: this is OUR OWN unit — deferring to a detached restart"
+  if command -v systemd-run >/dev/null 2>&1; then
+    # --on-active gives the script a few seconds to reach the summary/push
+    # phase and exit cleanly before its own gateway is cycled.
+    # AccuracySec=1s is REQUIRED: systemd's default timer accuracy is 1min,
+    # so a bare --on-active=8s can drift ~a minute before firing. Verified
+    # 2026-08-09: default drifted to +10s/unbounded, AccuracySec=1s fired at +9s.
+    if systemd-run --user --quiet --collect \
+         --unit="hermes-selfrestart-$$" \
+         --on-active=8s \
+         --timer-property=AccuracySec=1s \
+         --description="deferred restart of $svc after fork-update" \
+         systemctl --user restart "$svc" 2>/dev/null
+    then
+      c_ok "  $svc restart scheduled (+8s, detached transient timer)"
+      SELF_RESTART_SCHEDULED=1
+      return 0
+    fi
+    c_warn "  systemd-run failed — falling back to setsid"
+  fi
+  if command -v setsid >/dev/null 2>&1; then
+    setsid --fork sh -c "sleep 8; systemctl --user restart '$svc'" \
+      >/dev/null 2>&1 </dev/null &
+    c_ok "  $svc restart scheduled (+8s, detached setsid)"
+    SELF_RESTART_SCHEDULED=1
+    return 0
+  fi
+  c_warn "  cannot detach — restart manually: systemctl --user restart $svc"
+  return 1
+}
+
 restart_service_graceful() {
   # $1 = scope ("user" or "system"), $2 = unit name (without .service)
   local scope="$1" svc="$2"
@@ -339,15 +393,24 @@ if [[ "$SKIP_RESTART" -eq 1 ]]; then
 else
   c_step "Restarting hermes services"
 
+  if [[ -n "$SELF_UNIT" ]]; then
+    c_dim "  (running inside $SELF_UNIT — it will be restarted last, detached)"
+  fi
+
   # User-scope services (gateway + cron loops)
   USER_SVCS="$(systemctl --user list-units 'hermes-*' --plain --no-legend --no-pager 2>/dev/null \
     | awk '$3 == "active" && $1 ~ /\.service$/ { sub(/\.service$/, "", $1); print $1 }')"
 
   if [[ -n "$USER_SVCS" ]]; then
-    echo "$USER_SVCS" | while read -r svc; do
+    # NOTE: feed the loop via a here-string, NOT `echo | while`. A pipeline
+    # runs the loop body in a SUBSHELL, so SELF_RESTART_SCHEDULED set inside
+    # would be lost to the parent and the summary would lie.
+    while read -r svc; do
       [[ -z "$svc" ]] && continue
+      # Defer our own unit to the very end — restarting it here kills us.
+      [[ -n "$SELF_UNIT" && "$svc" == "$SELF_UNIT" ]] && continue
       restart_service_graceful user "$svc" || true
-    done
+    done <<< "$USER_SVCS"
   else
     c_dim "  (no active user-scope hermes services)"
   fi
@@ -361,21 +424,26 @@ else
     c_warn "system-scope services detected — will need sudo:"
     echo "$SYS_SVCS" | sed 's/^/    /'
     if [[ "$ASSUME_YES" -eq 1 ]]; then
-      echo "$SYS_SVCS" | while read -r svc; do
+      while read -r svc; do
         [[ -z "$svc" ]] && continue
         restart_service_graceful system "$svc" || true
-      done
+      done <<< "$SYS_SVCS"
     else
       read -rp "  Restart system-scope services with sudo? [y/N] " yn
       if [[ "$yn" =~ ^[Yy]$ ]]; then
-        echo "$SYS_SVCS" | while read -r svc; do
+        while read -r svc; do
           [[ -z "$svc" ]] && continue
           restart_service_graceful system "$svc" || true
-        done
+        done <<< "$SYS_SVCS"
       else
         c_warn "skipped. Restart manually: sudo systemctl restart <svc>"
       fi
     fi
+  fi
+
+  # Our own unit goes LAST, detached, so the script lives to finish.
+  if [[ -n "$SELF_UNIT" ]]; then
+    restart_self_detached "$SELF_UNIT" || true
   fi
 fi
 
@@ -399,4 +467,20 @@ echo "  local patches replayed:     $LOCAL_PATCHES"
 echo "  pre-update HEAD:            $PRE_SHORT"
 echo "  post-update HEAD:           $NEW_SHORT"
 echo
-c_dim "All hermes-gateway* and hermes-cron-* services restarted with new code."
+if [[ "$SKIP_RESTART" -eq 1 ]]; then
+  c_warn "Services NOT restarted (--no-restart). New code is on disk but every"
+  c_warn "running service is still executing STALE pre-upgrade bytecode."
+  c_dim  "  Restart when ready:  systemctl --user restart 'hermes-*'"
+elif [[ "${SELF_RESTART_SCHEDULED:-0}" -eq 1 ]]; then
+  c_ok  "All other hermes services restarted with new code."
+  c_warn "$SELF_UNIT restarts in ~8s (detached) — this session will drop."
+  c_dim  "  Verify after it returns:"
+  c_dim  "    systemctl --user list-units 'hermes-*' --plain --no-legend"
+  c_dim  "    systemctl --user show hermes-gateway -p ActiveEnterTimestamp --value"
+else
+  c_ok "All hermes-gateway* and hermes-cron-* services restarted with new code."
+fi
+c_dim "Confirm nothing is stale — every unit should show a post-upgrade start time:"
+c_dim "  for s in \$(systemctl --user list-units 'hermes-*' --plain --no-legend \\"
+c_dim "    | awk '{sub(/\\.service\$/,\"\",\$1); print \$1}'); do \\"
+c_dim "      printf '%-34s %s\\n' \"\$s\" \"\$(systemctl --user show -p ActiveEnterTimestamp --value \$s)\"; done"
