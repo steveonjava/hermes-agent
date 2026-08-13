@@ -229,6 +229,13 @@ class GatewayKanbanWatchersMixin:
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
+                    gateway_config = getattr(self, "config", None)
+                    fallback_platforms = {
+                        home.platform.value.lower()
+                        for cfg in getattr(gateway_config, "platforms", {}).values()
+                        if (home := cfg.home_channel) is not None
+                        and self._authorization_adapter(home.platform, notifier_profile) is not None
+                    }
                     # Widen to every platform any secondary profile has live,
                     # not just the default profile's. This is only a coarse
                     # pre-filter to skip claiming events for subs nobody can
@@ -337,11 +344,13 @@ class GatewayKanbanWatchersMixin:
                                             continue
                                     platform = (sub.get("platform") or "").lower()
                                     if platform not in active_platforms:
-                                        logger.debug(
-                                            "kanban notifier: subscription for %s on %s skipped; adapter not connected",
-                                            sub.get("task_id"), platform or "<missing>",
-                                        )
-                                        continue
+                                        fallback_available = bool(fallback_platforms)
+                                        if not fallback_available:
+                                            logger.debug(
+                                                "kanban notifier: subscription for %s on %s skipped; adapter not connected",
+                                                sub.get("task_id"), platform or "<missing>",
+                                            )
+                                            continue
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
@@ -404,18 +413,53 @@ class GatewayKanbanWatchersMixin:
                     # (or default) genuinely has no adapter for the platform.
                     adapter = self._authorization_adapter(plat, sub_profile or None)
                     if adapter is None:
+                        # A profile can receive a task request from a platform it does
+                        # not serve. Redirect the notification to one of its live home
+                        # channels rather than leaving the claimed event undeliverable.
+                        destination = next(
+                            (
+                                candidate.home_channel
+                                for candidate in getattr(
+                                    getattr(self, "config", None), "platforms", {},
+                                ).values()
+                                if candidate.home_channel is not None
+                                and self._authorization_adapter(
+                                    candidate.home_channel.platform,
+                                    sub_profile or None,
+                                )
+                                is not None
+                            ),
+                            None,
+                        )
+                        if destination is None:
+                            logger.debug(
+                                "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
+                                platform_str,
+                                sub["task_id"],
+                            )
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                sub,
+                                d["cursor"],
+                                d.get("old_cursor", 0),
+                                board_slug,
+                            )
+                            continue
+
+                        original_platform = platform_str
+                        plat = destination.platform
+                        platform_str = plat.value
+                        adapter = self._authorization_adapter(plat, sub_profile or None)
+                        sub["platform"] = platform_str
+                        sub["chat_id"] = destination.chat_id
+                        sub["thread_id"] = destination.thread_id or ""
                         logger.debug(
-                            "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
-                            platform_str, sub["task_id"],
+                            "kanban notifier: %s adapter unavailable for %s; falling back to home channel %s/%s",
+                            original_platform,
+                            sub["task_id"],
+                            platform_str,
+                            destination.chat_id,
                         )
-                        await asyncio.to_thread(
-                            self._kanban_rewind,
-                            sub,
-                            d["cursor"],
-                            d.get("old_cursor", 0),
-                            board_slug,
-                        )
-                        continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     # Per-subscription failure-counter key. Hoisted out of the

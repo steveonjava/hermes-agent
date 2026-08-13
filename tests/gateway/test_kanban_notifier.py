@@ -3,7 +3,7 @@ import sqlite3
 from pathlib import Path
 
 
-from gateway.config import Platform
+from gateway.config import HomeChannel, Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
     _release_singleton_lock,
@@ -408,6 +408,51 @@ def _unseen_terminal_events_for(tid, chat_id):
         return events
     finally:
         conn.close()
+
+
+
+
+def test_kanban_notifier_falls_back_to_live_home_channel(tmp_path, monkeypatch):
+    db_path = tmp_path / "home-channel-fallback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="fallback task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="telegram-chat")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.MATRIX: adapter}
+    runner.config = type(
+        "Config",
+        (),
+        {
+            "platforms": {
+                Platform.MATRIX: type(
+                    "PlatformConfig",
+                    (),
+                    {
+                        "home_channel": HomeChannel(
+                            platform=Platform.MATRIX,
+                            chat_id="matrix-home",
+                            name="Home",
+                            thread_id="topic-7",
+                        ),
+                    },
+                )(),
+            },
+        },
+    )()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [delivery["chat_id"] for delivery in adapter.sent] == ["matrix-home"]
+    assert adapter.sent[0]["metadata"]["thread_id"] == "topic-7"
 
 
 def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch):
