@@ -140,3 +140,20 @@ def test_locales_dir_env_override_ignored_when_missing(tmp_path, monkeypatch):
     assert result.name == "locales"
 
 
+def test_locales_dir_uses_package_data_without_a_source_checkout(tmp_path, monkeypatch):
+    """Wheel installs must resolve locale YAML beside the installed package."""
+    package_dir = tmp_path / "site-packages" / "agent"
+    package_dir.mkdir(parents=True)
+    packaged_locales = package_dir / "locales"
+    packaged_locales.mkdir()
+    (packaged_locales / "en.yaml").write_text("foo: Packaged Foo\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_BUNDLED_LOCALES", raising=False)
+    monkeypatch.setattr(i18n, "__file__", str(package_dir / "i18n.py"))
+    i18n.reset_language_cache()
+    try:
+        assert i18n._locales_dir() == packaged_locales
+        assert i18n.t("foo", lang="en") == "Packaged Foo"
+    finally:
+        i18n.reset_language_cache()
+
+

@@ -97,6 +97,7 @@ def _locales_dir() -> Path:
        sealed-packaging system) to point at the installed catalog directory.
     2. ``<repo-root>/locales`` -- source checkouts and editable installs,
        where the working tree sits next to ``agent/``.
+    3. ``agent/locales`` -- YAML package data included in wheel installs.
 
     Falling through to the source-style path (even when missing) keeps
     ``_load_catalog`` error messages informative -- it logs the path it
@@ -115,7 +116,12 @@ def _locales_dir() -> Path:
 
     # agent/i18n.py -> agent/ -> repo root (source checkout, editable install)
     source_dir = Path(__file__).resolve().parent.parent / "locales"
-    return source_dir
+    if source_dir.is_dir():
+        return source_dir
+
+    # Wheels do not retain the repository root, so locale data lives beside
+    # this module and remains available in sealed release virtualenvs.
+    return Path(__file__).resolve().parent / "locales"
 
 
 def _normalize_lang(value: Any) -> str:
