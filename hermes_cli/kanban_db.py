@@ -10621,9 +10621,10 @@ def _resolve_hermes_argv() -> list[str]:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
 
-    hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
-    if hermes_bin:
-        return _hermes_path_argv(hermes_bin)
+    # The dispatcher already runs inside Hermes. Prefer its interpreter over an
+    # implicit PATH shim, which may name a sealed release unavailable to the
+    # service account. Operators can still opt into a known launcher through
+    # HERMES_BIN above.
     return _module_hermes_argv()
 
 

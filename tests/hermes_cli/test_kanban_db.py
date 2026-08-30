@@ -1193,6 +1193,17 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 
 
+def test_resolve_hermes_argv_uses_module_form_when_path_shim_is_implicit(monkeypatch):
+    """An inherited service PATH must not select an unverified release shim."""
+    import shutil
+    import sys
+    import hermes_cli.kanban_db as kb
+
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "/sealed/release/venv/bin/hermes")
+    assert kb._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+
+
 def test_resolve_hermes_argv_module_actually_runs():
     """The fallback module name must be importable + runnable.
 
