@@ -64,37 +64,41 @@ def _preflight_request_tokens(
     transcript. Auxiliary compression still uses the generic estimator
     (``native_compaction_eligible=False``).
 
-    Usage-anchored fast path: when a provider-reported usage anchor is
-    valid for ``messages`` (see ``anchored_context_tokens``), it already
-    covers system prompt + tool schemas + full history EXACTLY as the
-    provider counted them, with estimation confined to the messages
-    appended since that response. Prefer it over every heuristic.
+    A route-valid native checkpoint describes the *next* wire shape, while the
+    provider usage attached to the response that produced it describes the
+    larger pre-compaction request. Prefer the checkpoint-pruned estimate in
+    that case. Before the first checkpoint, retain the provider-reported usage
+    anchor because it is more accurate than heuristic conversion.
     """
-    anchored = anchored_context_tokens(
-        messages, getattr(agent, "_usage_anchor", None)
-    )
-    if anchored is not None:
-        return anchored
     tools = getattr(agent, "tools", None) or None
+    native_estimate = None
     try:
         from agent.codex_responses_adapter import (
-            estimate_native_responses_preflight_tokens,
+            native_responses_preflight_estimate,
         )
 
-        native = estimate_native_responses_preflight_tokens(
+        native_estimate = native_responses_preflight_estimate(
             agent,
             messages,
             system_prompt=system_prompt or "",
             tools=tools,
         )
-        if isinstance(native, int) and not isinstance(native, bool) and native >= 0:
-            return native
+        if native_estimate is not None and native_estimate.has_checkpoint:
+            return native_estimate.tokens
     except Exception:
         logger.debug(
             "native Responses preflight estimate unavailable; "
-            "using generic transcript estimate",
+            "checking provider usage anchor",
             exc_info=True,
         )
+
+    anchored = anchored_context_tokens(
+        messages, getattr(agent, "_usage_anchor", None)
+    )
+    if anchored is not None:
+        return anchored
+    if native_estimate is not None:
+        return native_estimate.tokens
     if _agent_stale_thinking_on_wire(agent):
         return estimate_request_tokens_rough(
             messages,

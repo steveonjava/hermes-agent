@@ -885,14 +885,19 @@ def classify_responses_route(agent: Any) -> ResponsesRouteFlags:
     )
 
 
-def estimate_native_responses_preflight_tokens(
+class NativeResponsesPreflightEstimate(NamedTuple):
+    tokens: int
+    has_checkpoint: bool
+
+
+def native_responses_preflight_estimate(
     agent: Any,
     messages: List[Dict[str, Any]],
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[int]:
-    """Estimate tokens for the checkpoint-pruned Responses payload.
+) -> Optional[NativeResponsesPreflightEstimate]:
+    """Describe the route-valid next Responses request for preflight.
 
     Automatic preflight previously counted the full durable transcript.
     On a natively compacted Codex session that overstates the wire by
@@ -900,8 +905,8 @@ def estimate_native_responses_preflight_tokens(
     request will never send (#96155).
 
     Returns None when native compaction is not proven eligible for this
-    request, or when conversion fails — the caller must then use the
-    generic durable-transcript estimate (conservative).
+    request or when conversion fails. ``has_checkpoint`` is true only when a
+    route-valid checkpoint survives conversion and will prune the next wire.
     """
     if getattr(agent, "api_mode", None) != "codex_responses":
         return None
@@ -949,11 +954,35 @@ def estimate_native_responses_preflight_tokens(
 
     from agent.model_metadata import estimate_request_tokens_rough
 
-    return estimate_request_tokens_rough(
+    tokens = estimate_request_tokens_rough(
         items,
         system_prompt=system_prompt or "",
         tools=tools,
     )
+    return NativeResponsesPreflightEstimate(
+        tokens=tokens,
+        has_checkpoint=any(
+            isinstance(item, dict) and item.get("type") == "compaction"
+            for item in items
+        ),
+    )
+
+
+def estimate_native_responses_preflight_tokens(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[int]:
+    """Estimate tokens for the route-valid native Responses request."""
+    estimate = native_responses_preflight_estimate(
+        agent,
+        messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    )
+    return estimate.tokens if estimate is not None else None
 
 
 # ---------------------------------------------------------------------------

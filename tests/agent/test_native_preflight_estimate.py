@@ -3,7 +3,11 @@
 from types import SimpleNamespace
 
 from agent.codex_responses_adapter import estimate_native_responses_preflight_tokens
-from agent.model_metadata import estimate_request_tokens_rough
+from agent.model_metadata import (
+    anchored_context_tokens,
+    capture_usage_anchor,
+    estimate_request_tokens_rough,
+)
 from agent.turn_context import _preflight_request_tokens
 
 
@@ -90,6 +94,78 @@ def test_preflight_wrapper_uses_pruned_estimate_when_eligible():
 
     assert native is not None
     assert wrapped == native
+
+
+def test_checkpoint_pruned_wire_beats_pre_compaction_usage_anchor():
+    messages = _history_with_checkpoint()
+    pre_checkpoint = messages[:-2]
+    anchor = capture_usage_anchor(529_751, 1_000, pre_checkpoint)
+    agent = _codex_agent(_usage_anchor=anchor)
+    native = estimate_native_responses_preflight_tokens(agent, messages)
+
+    anchored = anchored_context_tokens(messages, anchor)
+    assert native is not None and native < 8_000
+    assert anchored is not None and anchored > 525_000
+    assert _preflight_request_tokens(agent, messages, "") == native
+
+
+def test_trusted_proxy_checkpoint_beats_pre_compaction_usage_anchor():
+    messages = _history_with_checkpoint()
+    messages[-2]["codex_reasoning_items"][0]["_issuer_kind"] = (
+        "other:http://litellm.example:4000/v1"
+    )
+    pre_checkpoint = messages[:-2]
+    anchor = capture_usage_anchor(529_751, 1_000, pre_checkpoint)
+    agent = _codex_agent(
+        _usage_anchor=anchor,
+        provider="custom",
+        base_url="http://litellm.example:4000/v1",
+        _base_url_hostname="litellm.example",
+        _base_url_lower="http://litellm.example:4000/v1",
+        capabilities={"openai_native_compaction": True},
+        runtime_capabilities={"native_compaction": True},
+    )
+    native = estimate_native_responses_preflight_tokens(agent, messages)
+
+    assert native is not None and native < 8_000
+    assert _preflight_request_tokens(agent, messages, "") == native
+
+
+def test_usage_anchor_stays_preferred_before_first_checkpoint():
+    messages = _history_with_checkpoint()[:-2]
+    anchor = capture_usage_anchor(50_000, 250, messages)
+    messages.extend(
+        [
+            {"role": "assistant", "content": "normal reply"},
+            {"role": "user", "content": "follow-up without checkpoint"},
+        ]
+    )
+    agent = _codex_agent(_usage_anchor=anchor)
+
+    assert _preflight_request_tokens(agent, messages, "") == anchored_context_tokens(
+        messages, anchor
+    )
+
+
+def test_foreign_checkpoint_does_not_displace_usage_anchor():
+    messages = _history_with_checkpoint()
+    pre_checkpoint = messages[:-2]
+    checkpoint = messages[-2]["codex_reasoning_items"][0]
+    checkpoint["_issuer_kind"] = "other:https://foreign.example/v1"
+    anchor = capture_usage_anchor(50_000, 250, pre_checkpoint)
+    agent = _codex_agent(_usage_anchor=anchor)
+
+    assert _preflight_request_tokens(agent, messages, "") == anchored_context_tokens(
+        messages, anchor
+    )
+
+
+def test_genuinely_large_post_checkpoint_tail_still_crosses_local_threshold():
+    messages = _history_with_checkpoint()
+    messages.append({"role": "user", "content": "x" * 2_200_000})
+    agent = _codex_agent()
+
+    assert _preflight_request_tokens(agent, messages, "") > 525_000
 
 
 def test_preflight_wrapper_falls_back_to_generic_when_ineligible():
