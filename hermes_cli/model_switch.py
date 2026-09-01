@@ -765,6 +765,7 @@ class ModelSwitchResult:
     provider_label: str = ""
     resolved_via_alias: str = ""
     capabilities: Optional[ModelCapabilities] = None
+    provider_capabilities: Optional[dict[str, bool]] = None
     runtime_capabilities: Optional[dict[str, bool]] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
@@ -1583,6 +1584,7 @@ def switch_model(
     current_model: str,
     current_base_url: str = "",
     current_api_key: str = "",
+    current_provider_capabilities: Optional[dict[str, bool]] = None,
     is_global: bool = False,
     explicit_provider: str = "",
     user_providers: dict = None,
@@ -1617,6 +1619,7 @@ def switch_model(
         current_model: The currently active model name.
         current_base_url: The currently active base URL.
         current_api_key: The currently active API key.
+        current_provider_capabilities: Explicit capabilities for the active route.
         is_global: Whether to persist the switch.
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
@@ -1989,7 +1992,17 @@ def switch_model(
     api_key = current_api_key
     base_url = current_base_url
     api_mode = ""
-    runtime_capabilities: dict[str, bool] = {}
+    provider_capabilities: dict[str, bool] = (
+        {
+            key: value
+            for key, value in current_provider_capabilities.items()
+            if isinstance(key, str) and isinstance(value, bool)
+        }
+        if isinstance(current_provider_capabilities, dict)
+        and (target_provider or "").strip().lower()
+        == (current_provider or "").strip().lower()
+        else {}
+    )
     ollama_headers: dict[str, str] = {}
     validation_headers: dict[str, str] = {}
     suppress_ollama_headers = False
@@ -2034,7 +2047,7 @@ def switch_model(
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
                 api_mode = runtime.get("api_mode", "")
-                runtime_capabilities = runtime.get("capabilities") or {}
+                provider_capabilities = runtime.get("capabilities") or {}
                 validation_headers = runtime.get("extra_headers") or validation_headers
             except Exception:
                 api_key = _ukey
@@ -2053,7 +2066,7 @@ def switch_model(
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
-                runtime_capabilities = runtime.get("capabilities") or {}
+                provider_capabilities = runtime.get("capabilities") or {}
                 validation_headers = runtime.get("extra_headers") or validation_headers
             except Exception as e:
                 return ModelSwitchResult(
@@ -2114,7 +2127,7 @@ def switch_model(
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
-                runtime_capabilities = runtime.get("capabilities") or {}
+                provider_capabilities = runtime.get("capabilities") or {}
                 validation_headers = runtime.get("extra_headers") or validation_headers
             except Exception:
                 pass
@@ -2376,14 +2389,37 @@ def switch_model(
         from hermes_cli.models import normalize_opencode_base_url
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
-    # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model, allow_network=True)
+    # Recover route capabilities when a same-provider switch reused the current
+    # endpoint without calling resolve_runtime_provider again.
+    if not provider_capabilities and isinstance(custom_providers, list):
+        from hermes_cli.config import normalize_route_base_url
+
+        target_route = normalize_route_base_url(base_url)
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            if normalize_route_base_url(entry.get("base_url")) != target_route:
+                continue
+            raw_capabilities = entry.get("capabilities")
+            if isinstance(raw_capabilities, dict):
+                provider_capabilities = {
+                    key: value
+                    for key, value in raw_capabilities.items()
+                    if isinstance(key, str) and isinstance(value, bool)
+                }
+            break
+
+    # --- Get model metadata and resolve route-specific runtime capability ---
+    capabilities = get_model_capabilities(
+        target_provider, new_model, allow_network=True
+    )
     from agent.native_compaction import resolve_native_compaction_capabilities
     runtime_capabilities = resolve_native_compaction_capabilities(
         model=new_model,
         base_url=base_url,
         provider=target_provider,
         is_codex_backend=target_provider.strip().lower() == "openai-codex",
+        provider_capabilities=provider_capabilities,
     )
 
     # --- Get full model info from models.dev ---
@@ -2427,6 +2463,11 @@ def switch_model(
         provider_label=provider_label,
         resolved_via_alias=resolved_alias,
         capabilities=capabilities,
+        provider_capabilities={
+            key: value
+            for key, value in provider_capabilities.items()
+            if isinstance(key, str) and isinstance(value, bool)
+        },
         runtime_capabilities={
             key: value
             for key, value in runtime_capabilities.items()

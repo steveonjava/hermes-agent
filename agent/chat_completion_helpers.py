@@ -2981,11 +2981,22 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # single stream attempt.
         _reset_stale_streak(agent)
         from agent.native_compaction import resolve_native_compaction_capabilities
+        fallback_capabilities = fb.get("capabilities")
+        agent.capabilities = (
+            {
+                key: value
+                for key, value in fallback_capabilities.items()
+                if isinstance(key, str) and isinstance(value, bool)
+            }
+            if isinstance(fallback_capabilities, dict)
+            else {}
+        )
         agent.runtime_capabilities = resolve_native_compaction_capabilities(
             model=agent.model,
             base_url=agent.base_url,
             provider=fb_provider,
             is_codex_backend=fb_provider == "openai-codex",
+            provider_capabilities=agent.capabilities,
         )
         return True
     except Exception as e:

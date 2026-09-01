@@ -1809,6 +1809,7 @@ class GatewaySlashCommandsMixin:
         current_provider = "openrouter"
         current_base_url = ""
         current_api_key = ""
+        current_provider_capabilities = {}
         user_provs = None
         custom_provs = None
         excluded_provs = []
@@ -1849,6 +1850,9 @@ class GatewaySlashCommandsMixin:
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+            current_provider_capabilities = dict(
+                override.get("capabilities") or {}
+            )
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -1887,6 +1891,7 @@ class GatewaySlashCommandsMixin:
                     _cur_provider = current_provider
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
+                    _cur_capabilities = current_provider_capabilities
                     _picker_profile_home = _command_profile_home
 
                     async def _on_model_selected_scoped(
@@ -1907,6 +1912,7 @@ class GatewaySlashCommandsMixin:
                             current_model=_cur_model,
                             current_base_url=_cur_base_url,
                             current_api_key=_cur_api_key,
+                            current_provider_capabilities=_cur_capabilities,
                             is_global=persist_global,
                             explicit_provider=provider_slug,
                             user_providers=user_provs,
@@ -1950,7 +1956,10 @@ class GatewaySlashCommandsMixin:
                                     api_key=result.api_key,
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
-                                    capabilities=getattr(
+                                    provider_capabilities=getattr(
+                                        result, "provider_capabilities", None
+                                    ),
+                                    runtime_capabilities=getattr(
                                         result, "runtime_capabilities", None
                                     ),
                                 )
@@ -2013,7 +2022,7 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                             "request_overrides": dict(result.request_overrides or {}),
-                            "capabilities": dict(result.runtime_capabilities or {}),
+                            "capabilities": dict(result.provider_capabilities or {}),
                         }
 
                         # Write-through the non-secret parts to the session
@@ -2221,6 +2230,7 @@ class GatewaySlashCommandsMixin:
             current_model=current_model,
             current_base_url=current_base_url,
             current_api_key=current_api_key,
+            current_provider_capabilities=current_provider_capabilities,
             is_global=persist_global,
             explicit_provider=explicit_provider,
             user_providers=user_provs,
@@ -2268,7 +2278,12 @@ class GatewaySlashCommandsMixin:
                         api_key=result.api_key,
                         base_url=result.base_url,
                         api_mode=result.api_mode,
-                        capabilities=getattr(result, "runtime_capabilities", None),
+                        provider_capabilities=getattr(
+                            result, "provider_capabilities", None
+                        ),
+                        runtime_capabilities=getattr(
+                            result, "runtime_capabilities", None
+                        ),
                     )
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
@@ -2328,7 +2343,7 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
                 "request_overrides": dict(result.request_overrides or {}),
-                "capabilities": dict(result.runtime_capabilities or {}),
+                "capabilities": dict(result.provider_capabilities or {}),
             }
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):

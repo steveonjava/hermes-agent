@@ -9339,6 +9339,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if stored_api_mode:
                 self.api_mode = stored_api_mode
         if provider_changed:
+            resume_provider_capabilities: dict[str, bool] = {}
             # Stale launch-time explicit overrides belong to the AMBIENT
             # provider; carrying them into the restored provider's
             # resolution poisons _ensure_runtime_credentials on startup
@@ -9359,24 +9360,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.base_url = resolved["base_url"]
                 if not stored_api_mode and resolved.get("api_mode"):
                     self.api_mode = resolved["api_mode"]
+                raw_capabilities = resolved.get("capabilities")
+                if isinstance(raw_capabilities, dict):
+                    resume_provider_capabilities = {
+                        key: value
+                        for key, value in raw_capabilities.items()
+                        if isinstance(key, str) and isinstance(value, bool)
+                    }
             except Exception:
                 logger.debug(
                     "Credential re-resolution for resumed session provider "
                     "%s failed; keeping ambient credentials",
                     stored_provider, exc_info=True,
                 )
+        else:
+            raw_capabilities = getattr(self.agent, "capabilities", {})
+            resume_provider_capabilities = (
+                dict(raw_capabilities) if isinstance(raw_capabilities, dict) else {}
+            )
         # If the agent is already running (mid-chat /resume), swap it
         # in-place so the next turn uses the restored model. On startup
         # --resume the agent isn't built yet — _init_agent will pick up
         # self.model / self.provider when constructing AIAgent.
         if self.agent is not None:
             try:
+                from agent.native_compaction import (
+                    resolve_native_compaction_capabilities,
+                )
+
+                resume_runtime_capabilities = resolve_native_compaction_capabilities(
+                    model=self.model,
+                    base_url=self.base_url,
+                    provider=self.provider,
+                    is_codex_backend=(self.provider or "").strip().lower()
+                    == "openai-codex",
+                    provider_capabilities=resume_provider_capabilities,
+                )
                 self.agent.switch_model(
                     new_model=self.model,
                     new_provider=self.provider,
                     api_key=self.api_key or "",
                     base_url=self.base_url or "",
                     api_mode=self.api_mode or "",
+                    provider_capabilities=resume_provider_capabilities,
+                    runtime_capabilities=resume_runtime_capabilities,
                 )
             except Exception:
                 logger.debug(
@@ -10433,6 +10460,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     current_model=self.model or "",
                     current_base_url=self.base_url or "",
                     current_api_key=self.api_key or "",
+                    current_provider_capabilities=dict(
+                        getattr(getattr(self, "agent", None), "capabilities", {}) or {}
+                    ),
                     is_global=False,
                     explicit_provider=_config_provider or "",
                 )
@@ -10444,7 +10474,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             api_key=_reset_result.api_key,
                             base_url=_reset_result.base_url,
                             api_mode=_reset_result.api_mode,
-                            capabilities=getattr(
+                            provider_capabilities=getattr(
+                                _reset_result, "provider_capabilities", None
+                            ),
+                            runtime_capabilities=getattr(
                                 _reset_result, "runtime_capabilities", None
                             ),
                         )
@@ -11576,6 +11609,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "provider_capabilities": copy.deepcopy(
+                getattr(agent, "capabilities", {}) or {}
+            ) if agent is not None else {},
+            "runtime_capabilities": copy.deepcopy(
+                getattr(agent, "runtime_capabilities", {}) or {}
+            ) if agent is not None else {},
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None,
@@ -11621,7 +11660,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=snapshot.get("api_key", ""),
                     base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
-                    capabilities=snapshot.get("capabilities"),
+                    provider_capabilities=snapshot.get("provider_capabilities"),
+                    runtime_capabilities=snapshot.get("runtime_capabilities"),
                 )
             except Exception as exc:
                 logger.warning("CLI one-turn model restore failed: %s", exc)
@@ -11766,7 +11806,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
-                    capabilities=getattr(result, "runtime_capabilities", None),
+                    provider_capabilities=getattr(
+                        result, "provider_capabilities", None
+                    ),
+                    runtime_capabilities=getattr(result, "runtime_capabilities", None),
                 )
             except Exception as exc:
                 # The agent rolled itself back to the old working model/client.
@@ -11915,6 +11958,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     current_model=self.model or "",
                     current_base_url=self.base_url or "",
                     current_api_key=self.api_key or "",
+                    current_provider_capabilities=dict(
+                        getattr(getattr(self, "agent", None), "capabilities", {}) or {}
+                    ),
                     is_global=persist_global,
                     explicit_provider=provider_data.get("slug"),
                     user_providers=state.get("user_provs"),
@@ -12058,6 +12104,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             current_model=self.model or "",
             current_base_url=self.base_url or "",
             current_api_key=self.api_key or "",
+            current_provider_capabilities=dict(
+                getattr(getattr(self, "agent", None), "capabilities", {}) or {}
+            ),
             is_global=persist_global,
             explicit_provider=explicit_provider,
             user_providers=user_provs,
@@ -12157,7 +12206,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
-                    capabilities=getattr(result, "runtime_capabilities", None),
+                    provider_capabilities=getattr(
+                        result, "provider_capabilities", None
+                    ),
+                    runtime_capabilities=getattr(result, "runtime_capabilities", None),
                 )
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a

@@ -1116,7 +1116,7 @@ def _preflight_codex_input_items(
 
         if item_type == "compaction":
             # Replayed native server-side compaction checkpoint (gpt-5.6,
-            # direct OpenAI/Codex routes). Opaque, issuer-sealed; forward
+            # direct OpenAI/Codex or a trusted proxy). Opaque, issuer-sealed; forward
             # only the fields the API defines.
             encrypted = item.get("encrypted_content")
             if isinstance(encrypted, str) and encrypted:

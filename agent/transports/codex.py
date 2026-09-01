@@ -572,8 +572,8 @@ class ResponsesApiTransport(ProviderTransport):
             # encrypted reasoning replay for this endpoint.
             if _is_post_tool_replay(payload_messages):
                 replay_encrypted_reasoning = False
-        # Native server-side compaction (gpt-5.6 on direct OpenAI/Codex routes
-        # only). The caller resolves eligibility via
+        # Native server-side compaction (gpt-5.6 on direct OpenAI/Codex or an
+        # explicitly trusted provider proxy). The caller resolves eligibility via
         # agent.native_compaction.native_compaction_context_management();
         # None means the field is never added to the request.
         context_management = params.get("context_management")

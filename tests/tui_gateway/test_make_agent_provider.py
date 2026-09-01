@@ -97,6 +97,7 @@ def test_apply_model_switch_does_not_leak_process_env():
             self.provider = "minimax"
             self.base_url = ""
             self.api_key = ""
+            self.capabilities = {"openai_native_compaction": True}
 
         def switch_model(self, **kw):
             self.model = kw["new_model"]
@@ -111,13 +112,18 @@ def test_apply_model_switch_does_not_leak_process_env():
 
     sess_b = {"agent": _FakeAgent(), "session_key": "k-B", "model_override": None}
     sess_a = {"agent": _FakeAgent(), "session_key": "k-A", "model_override": None}
+    switch_kwargs = {}
+
+    def _switch_model(**kwargs):
+        switch_kwargs.update(kwargs)
+        return _FakeResult()
 
     with (
         patch("hermes_cli.model_switch.parse_model_flags",
               return_value=("glm-5.1", None, False, False, True)),
         patch("hermes_cli.model_switch.resolve_persist_behavior",
               return_value=False),
-        patch("hermes_cli.model_switch.switch_model", return_value=_FakeResult()),
+        patch("hermes_cli.model_switch.switch_model", side_effect=_switch_model),
         patch("tui_gateway.server._emit"),
         patch("tui_gateway.server._restart_slash_worker"),
         patch("tui_gateway.server._session_info", return_value={}),
@@ -137,6 +143,9 @@ def test_apply_model_switch_does_not_leak_process_env():
     assert sess_b["model_override"]["provider"] == "zai"
     # The switched agent mutated in place.
     assert sess_b["agent"].model == "zai/glm-5.1"
+    assert switch_kwargs["current_provider_capabilities"] == {
+        "openai_native_compaction": True
+    }
     # Sibling session is completely untouched.
     assert sess_a["model_override"] is None
     assert sess_a["agent"].model == "minimax/m3"

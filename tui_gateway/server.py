@@ -6241,6 +6241,12 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
+        "provider_capabilities": copy.deepcopy(
+            getattr(agent, "capabilities", {}) or {}
+        ),
+        "runtime_capabilities": copy.deepcopy(
+            getattr(agent, "runtime_capabilities", {}) or {}
+        ),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
     }
 
@@ -6266,7 +6272,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             api_key=snapshot.get("api_key", ""),
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
-            capabilities=snapshot.get("capabilities"),
+            provider_capabilities=snapshot.get("provider_capabilities"),
+            runtime_capabilities=snapshot.get("runtime_capabilities"),
         )
 
 
@@ -6375,15 +6382,22 @@ def _apply_model_switch(
         current_model = getattr(agent, "model", "") or ""
         current_base_url = getattr(agent, "base_url", "") or ""
         current_api_key = getattr(agent, "api_key", "") or ""
+        current_provider_capabilities = dict(
+            getattr(agent, "capabilities", {}) or {}
+        )
     else:
         current_model = _resolve_model()
         current_provider = explicit_provider.strip()
         current_base_url = ""
         current_api_key = ""
+        current_provider_capabilities = {}
         if not explicit_provider:
             runtime = resolve_runtime_provider(requested=None)
             current_provider = str(runtime.get("provider", "") or "")
             current_base_url = str(runtime.get("base_url", "") or "")
+            current_provider_capabilities = dict(
+                runtime.get("capabilities") or {}
+            )
             # Preserve a callable api_key (Azure Foundry Entra ID bearer
             # provider) unchanged — ``str(...)`` would produce
             # ``"<function ...>"`` and poison downstream switch_model
@@ -6415,6 +6429,7 @@ def _apply_model_switch(
         current_model=current_model,
         current_base_url=current_base_url,
         current_api_key=current_api_key,
+        current_provider_capabilities=current_provider_capabilities,
         is_global=persist_global,
         explicit_provider=explicit_provider,
         user_providers=user_provs,
@@ -6479,7 +6494,10 @@ def _apply_model_switch(
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
-                capabilities=getattr(result, "runtime_capabilities", None),
+                provider_capabilities=getattr(
+                    result, "provider_capabilities", None
+                ),
+                runtime_capabilities=getattr(result, "runtime_capabilities", None),
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -9082,12 +9100,17 @@ def _make_agent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
+        requested_provider=(
+            runtime.get("requested_provider") or requested_provider or ""
+        ),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),
+        request_overrides=dict(runtime.get("request_overrides") or {}),
+        capabilities=dict(runtime.get("capabilities") or {}),
         quiet_mode=True,
         # verbose_logging controls DEBUG-level agent logging; it is intentionally
         # independent of tool_progress_mode (which only controls per-tool

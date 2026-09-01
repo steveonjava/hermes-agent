@@ -1,4 +1,4 @@
-"""Native OpenAI Responses server-side compaction — gpt-5.6 on direct OpenAI routes only.
+"""Native OpenAI Responses compaction for eligible, explicitly trusted routes.
 
 OpenAI's Responses API supports server-side compaction: include
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` in a
@@ -17,11 +17,11 @@ Hermes' support is deliberately narrow (live verification, Aug 2026):
   path (90s watchdog x 3 retries = a dead turn). There is no structured
   "unsupported" rejection to downgrade on, so the only safe gate is an
   explicit model-family check.
-* **Direct OpenAI routes only:** api.openai.com (API key) or the ChatGPT
-  Codex backend (subscription OAuth). Every other Responses surface
-  (xAI, GitHub/Copilot, relays, local servers) never sees the field —
-  most would 400 on the unknown parameter, and none can mint or decrypt
-  the compaction blob.
+* **Explicitly trusted routes only:** api.openai.com (API key), the ChatGPT
+  Codex backend (subscription OAuth), or a provider configured with the literal
+  boolean capability ``openai_native_compaction: true``. Unmarked and malformed
+  proxy declarations stay fail-closed because most compatible surfaces would
+  reject the field and cannot mint or decrypt the compaction blob.
 
 Ownership model: Hermes' local compression stays fully armed as the
 fallback owner. The native threshold is clamped safely below the local
@@ -74,17 +74,25 @@ def resolve_native_compaction_capabilities(
     base_url: Optional[str],
     provider: Optional[str] = None,
     is_codex_backend: bool = False,
+    provider_capabilities: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, bool]:
-    """Resolve the native-compaction capability for a runtime destination.
+    """Resolve native compaction for an eligible, explicitly trusted route.
 
     The result is deliberately explicit: a resolved ``False`` is different
     from an unresolved capability and must survive model switches unchanged.
+    Non-direct proxies are trusted only when their provider configuration uses
+    the literal boolean ``openai_native_compaction: true``.
     """
     normalized_provider = (provider or "").strip().lower()
     direct_default = normalized_provider == "openai" and not base_url
+    trusted_proxy = (
+        isinstance(provider_capabilities, dict)
+        and provider_capabilities.get("openai_native_compaction") is True
+    )
     eligible = is_native_compaction_model(model) and (
         direct_default
         or is_direct_openai_route(base_url, is_codex_backend=is_codex_backend)
+        or trusted_proxy
     )
     return {"native_compaction": eligible}
 
@@ -183,7 +191,7 @@ def native_compaction_context_management(
     """
     capabilities = getattr(agent, "runtime_capabilities", None)
     if isinstance(capabilities, dict):
-        if not bool(capabilities.get("native_compaction", False)):
+        if capabilities.get("native_compaction") is not True:
             return None
     if not bool(getattr(agent, "codex_responses_native_compaction", False)):
         return None
@@ -203,8 +211,8 @@ def native_compaction_context_management(
         return None
     if not is_native_compaction_model(getattr(agent, "model", None)):
         return None
-    trusted_proxy = bool(
-        getattr(agent, "capabilities", {}).get("openai_native_compaction", False)
+    trusted_proxy = (
+        getattr(agent, "capabilities", {}).get("openai_native_compaction") is True
     )
     if not trusted_proxy and not is_direct_openai_route(
         getattr(agent, "base_url", None), is_codex_backend=is_codex_backend

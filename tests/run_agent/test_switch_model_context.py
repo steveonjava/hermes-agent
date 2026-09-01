@@ -164,6 +164,30 @@ def test_cross_provider_switch_to_default_openai_preserves_native_capability():
     assert agent.runtime_capabilities == {"native_compaction": True}
 
 
+def test_untrusted_switch_cannot_enable_native_from_runtime_map_alone():
+    agent = _make_agent_with_compressor(config_context_length=None)
+    agent.provider = "openai"
+    agent.model = "gpt-5.6"
+    agent.base_url = "https://api.openai.com/v1"
+    agent.capabilities = {}
+    agent.runtime_capabilities = {"native_compaction": True}
+    agent._create_openai_client = lambda *_args, **_kwargs: MagicMock()
+
+    with patch("agent.model_metadata.get_model_context_length", return_value=128_000):
+        agent.switch_model(
+            "gpt-5.6-sol-chatgpt-tier",
+            "custom:untrusted-proxy",
+            api_key="sk-new",
+            base_url="https://untrusted-proxy.example/v1",
+            api_mode="codex_responses",
+            provider_capabilities=None,
+            runtime_capabilities={"native_compaction": True},
+        )
+
+    assert agent.capabilities == {}
+    assert agent.runtime_capabilities == {"native_compaction": False}
+
+
 def test_direct_start_model_override_does_not_inherit_profile_context_length():
     """A CLI ``--model`` startup override must not inherit another model's window."""
     cfg = {

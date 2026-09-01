@@ -168,6 +168,8 @@ class TestHandleReasoningCommand(unittest.TestCase):
             api_key="k2",
             base_url="https://openrouter.ai/api/v1",
             api_mode="chat_completions",
+            provider_capabilities={"openai_native_compaction": True},
+            runtime_capabilities={"native_compaction": True},
         )
         with patch.dict(
             CLI_CONFIG.setdefault("agent", {}),
@@ -187,6 +189,15 @@ class TestHandleReasoningCommand(unittest.TestCase):
         # Model reset to the config default via the live agent swap.
         self.assertEqual(stub.model, "config-default-model")
         agent.switch_model.assert_called_once()
+        switch_kwargs = agent.switch_model.call_args.kwargs
+        self.assertEqual(
+            switch_kwargs["provider_capabilities"],
+            {"openai_native_compaction": True},
+        )
+        self.assertEqual(
+            switch_kwargs["runtime_capabilities"],
+            {"native_compaction": True},
+        )
 
 
 # ---------------------------------------------------------------------------

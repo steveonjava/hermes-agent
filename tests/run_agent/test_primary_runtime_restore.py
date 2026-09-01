@@ -35,6 +35,9 @@ def _make_agent(
     provider="custom",
     base_url="https://my-llm.example.com/v1",
     request_overrides=None,
+    model="",
+    capabilities=None,
+    requested_provider="",
 ):
     """Create a minimal AIAgent with optional fallback config."""
     with (
@@ -53,9 +56,12 @@ def _make_agent(
         patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
     ):
         agent = AIAgent(
+            model=model,
             api_key="test-key-12345678",
             base_url=base_url,
             provider=provider,
+            requested_provider=requested_provider,
+            capabilities=capabilities,
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -89,6 +95,23 @@ class TestPrimaryRuntimeSnapshot:
         assert rt["api_mode"] == agent.api_mode
         assert "client_kwargs" in rt
         assert "compressor_context_length" in rt
+
+    def test_trusted_proxy_capabilities_enable_initial_runtime_and_snapshot(self):
+        provider_capabilities = {"openai_native_compaction": True}
+        agent = _make_agent(
+            model="gpt-5.6-sol-chatgpt-tier",
+            provider="custom",
+            requested_provider="custom:trusted-proxy",
+            base_url="https://trusted-proxy.example/v1",
+            capabilities=provider_capabilities,
+        )
+
+        assert agent.capabilities == provider_capabilities
+        assert agent.runtime_capabilities == {"native_compaction": True}
+        assert agent._primary_runtime["capabilities"] == provider_capabilities
+        assert agent._primary_runtime["runtime_capabilities"] == {
+            "native_compaction": True
+        }
 
     def test_snapshot_includes_request_overrides(self):
         overrides = {"extra_body": {"reasoning": {"effort": "medium"}}}
@@ -168,6 +191,33 @@ class TestRestorePrimaryRuntime:
         assert agent._fallback_activated is False
         assert agent.model == original_model
         assert agent.provider == original_provider
+
+    def test_fallback_disarms_and_restore_rearms_trusted_proxy_capability(self):
+        provider_capabilities = {"openai_native_compaction": True}
+        agent = _make_agent(
+            model="gpt-5.6-sol-chatgpt-tier",
+            provider="custom",
+            requested_provider="custom:trusted-proxy",
+            base_url="https://trusted-proxy.example/v1",
+            capabilities=provider_capabilities,
+            fallback_model={"provider": "openrouter", "model": "gpt-5.6"},
+        )
+        mock_client = _mock_resolve()
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, None),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.capabilities == {}
+        assert agent.runtime_capabilities == {"native_compaction": False}
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent.capabilities == provider_capabilities
+        assert agent.runtime_capabilities == {"native_compaction": True}
 
     def test_emits_user_visible_primary_restore_notice(self):
         agent = _make_agent(
@@ -817,8 +867,37 @@ class TestSwitchModelRequestOverridesSnapshot:
                 new_model=kwargs.get("new_model", "gpt-4o"),
                 new_provider=kwargs.get("new_provider", "openai"),
                 base_url=kwargs.get("base_url", "https://api.openai.com/v1"),
-                api_key=kwargs.get("api_key", "sk-test-1234567890"),
+                api_key=kwargs.get("api_key", "test-key-12345678"),
+                provider_capabilities=kwargs.get("provider_capabilities"),
+                runtime_capabilities=kwargs.get("runtime_capabilities"),
             )
+
+    def test_same_provider_switch_carries_both_capability_maps(self):
+        agent = _make_agent(
+            model="gpt-5.1",
+            provider="custom",
+            requested_provider="custom:trusted-proxy",
+            base_url="https://trusted-proxy.example/v1",
+            capabilities={"openai_native_compaction": True},
+        )
+
+        self._switch(
+            agent,
+            new_model="gpt-5.6-sol-chatgpt-tier",
+            new_provider="custom",
+            base_url="",
+            provider_capabilities={"openai_native_compaction": True},
+            runtime_capabilities={"native_compaction": True},
+        )
+
+        assert agent.capabilities == {"openai_native_compaction": True}
+        assert agent.runtime_capabilities == {"native_compaction": True}
+        assert agent._primary_runtime["capabilities"] == {
+            "openai_native_compaction": True
+        }
+        assert agent._primary_runtime["runtime_capabilities"] == {
+            "native_compaction": True
+        }
 
     def test_switch_snapshot_carries_request_overrides(self):
         overrides = {"extra_body": {"reasoning": {"effort": "high"}}}

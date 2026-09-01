@@ -208,7 +208,8 @@ class TestOneTurnNeverPersisted:
                 api_key="sk-test",
                 base_url="https://openrouter.ai/api/v1",
                 api_mode="chat_completions",
-                runtime_capabilities={"openai_native_compaction": True},
+                provider_capabilities={"openai_native_compaction": True},
+                runtime_capabilities={"native_compaction": True},
                 provider_label="OpenRouter",
             ),
         )

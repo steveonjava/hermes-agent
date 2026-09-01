@@ -171,6 +171,16 @@ class CLIAgentSetupMixin:
         self.acp_args = resolved_acp_args
         self._credential_pool = resolved_credential_pool
         self._provider_source = runtime.get("source")
+        raw_provider_capabilities = runtime.get("capabilities")
+        self._provider_capabilities = (
+            {
+                key: value
+                for key, value in raw_provider_capabilities.items()
+                if isinstance(key, str) and isinstance(value, bool)
+            }
+            if isinstance(raw_provider_capabilities, dict)
+            else {}
+        )
         self.api_key = api_key
         self.base_url = base_url
 
@@ -337,6 +347,7 @@ class CLIAgentSetupMixin:
             "command": self.acp_command,
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
+            "capabilities": getattr(self, "_provider_capabilities", {}),
         }
         route = {
             "model": self.model,
@@ -514,6 +525,7 @@ class CLIAgentSetupMixin:
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
+                "capabilities": getattr(self, "_provider_capabilities", {}),
             }
             effective_model = model_override or self.model
             self.agent = AIAgent(
@@ -526,6 +538,7 @@ class CLIAgentSetupMixin:
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
+                capabilities=runtime.get("capabilities"),
                 max_tokens=self.max_tokens,
                 max_iterations=self.max_turns,
                 run_budget_seconds=getattr(self, "run_budget_seconds", None),

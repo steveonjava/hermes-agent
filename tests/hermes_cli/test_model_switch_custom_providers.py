@@ -389,6 +389,88 @@ def test_switch_model_accepts_explicit_bare_custom_current_endpoint(monkeypatch)
     assert result.api_key == "sk-test"
 
 
+def test_switch_model_maps_trusted_proxy_provider_capability_to_runtime(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "custom",
+            "requested_provider": "custom:trusted-proxy",
+            "api_key": "sk-test",
+            "base_url": "https://trusted-proxy.example/v1",
+            "api_mode": "codex_responses",
+            "capabilities": {"openai_native_compaction": True},
+        },
+    )
+
+    result = switch_model(
+        raw_input="gpt-5.6-sol-chatgpt-tier",
+        current_provider="openrouter",
+        current_model="gpt-5.1",
+        current_base_url="https://openrouter.ai/api/v1",
+        current_api_key="sk-test",
+        explicit_provider="custom:trusted-proxy",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "trusted-proxy",
+                "base_url": "https://trusted-proxy.example/v1",
+                "api_key": "sk-test",
+                "api_mode": "codex_responses",
+                "model": "gpt-5.6-sol-chatgpt-tier",
+                "capabilities": {"openai_native_compaction": True},
+            }
+        ],
+    )
+
+    assert result.success is True
+    assert result.provider_capabilities == {"openai_native_compaction": True}
+    assert result.runtime_capabilities == {"native_compaction": True}
+
+
+def test_same_provider_switch_recovers_trusted_proxy_capability(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+    provider = {
+        "name": "trusted-proxy",
+        "base_url": "https://trusted-proxy.example/v1",
+        "api_key": "sk-test",
+        "api_mode": "codex_responses",
+        "model": "gpt-5.6-sol-chatgpt-tier",
+        "capabilities": {"openai_native_compaction": True},
+    }
+
+    result = switch_model(
+        raw_input="gpt-5.6-sol-chatgpt-tier",
+        current_provider="custom",
+        current_model="gpt-5.1",
+        current_base_url="https://trusted-proxy.example/v1",
+        current_api_key="sk-test",
+        current_provider_capabilities=provider["capabilities"],
+        explicit_provider="custom",
+        user_providers={},
+        custom_providers=[],
+    )
+
+    assert result.success is True
+    assert result.provider_capabilities == {"openai_native_compaction": True}
+    assert result.runtime_capabilities == {"native_compaction": True}
+
+
 def test_is_aggregator_recognizes_named_custom_provider():
     assert providers_mod.is_aggregator("custom:hpc-ai") is True
     assert providers_mod.is_aggregator("custom:litellm") is True

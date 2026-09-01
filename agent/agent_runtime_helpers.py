@@ -1485,6 +1485,12 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        raw_provider_capabilities = rt.get("capabilities", {})
+        if isinstance(raw_provider_capabilities, dict):
+            agent.capabilities = dict(raw_provider_capabilities)
+        raw_runtime_capabilities = rt.get("runtime_capabilities")
+        if isinstance(raw_runtime_capabilities, dict):
+            agent.runtime_capabilities = dict(raw_runtime_capabilities)
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
         agent.request_overrides = dict(rt.get("request_overrides") or {})
 
@@ -1748,6 +1754,9 @@ def restore_primary_runtime(agent) -> bool:
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        raw_provider_capabilities = rt.get("capabilities", {})
+        if isinstance(raw_provider_capabilities, dict):
+            agent.capabilities = dict(raw_provider_capabilities)
         if "runtime_capabilities" in rt:
             raw_capabilities = rt["runtime_capabilities"]
             if not isinstance(raw_capabilities, dict):
@@ -2914,6 +2923,8 @@ def switch_model(
     base_url='',
     api_mode='',
     capabilities=None,
+    provider_capabilities=None,
+    runtime_capabilities=None,
 ):
     """Switch the model/provider in-place for a live agent.
 
@@ -2956,16 +2967,44 @@ def switch_model(
     ).strip().lower():
         effective_base_url = getattr(agent, "base_url", "")
 
-    destination_capabilities = (
-        dict(capabilities)
-        if isinstance(capabilities, dict)
-        else resolve_native_compaction_capabilities(
-            model=new_model,
-            base_url=effective_base_url,
-            provider=new_provider,
-            is_codex_backend=(new_provider or '').strip().lower() == 'openai-codex',
-        )
+    destination_provider_capabilities = (
+        {
+            key: value
+            for key, value in provider_capabilities.items()
+            if isinstance(key, str) and isinstance(value, bool)
+        }
+        if isinstance(provider_capabilities, dict)
+        else {}
     )
+    supplied_runtime_capabilities = None
+    if isinstance(runtime_capabilities, dict):
+        supplied_runtime_capabilities = dict(runtime_capabilities)
+    elif provider_capabilities is None and isinstance(capabilities, dict):
+        # Backward compatibility for callers that passed the runtime map via
+        # ``capabilities`` before provider/runtime capabilities were separated.
+        supplied_runtime_capabilities = dict(capabilities)
+        if (old_provider or "").strip().lower() == normalized_new_provider:
+            destination_provider_capabilities = dict(
+                getattr(agent, "capabilities", {}) or {}
+            )
+
+    resolved_route_capabilities = resolve_native_compaction_capabilities(
+        model=new_model,
+        base_url=effective_base_url,
+        provider=new_provider,
+        is_codex_backend=(new_provider or '').strip().lower() == 'openai-codex',
+        provider_capabilities=destination_provider_capabilities,
+    )
+    if supplied_runtime_capabilities is not None:
+        destination_runtime_capabilities = supplied_runtime_capabilities
+        # Runtime maps are derived state, not an authorization source. A stale
+        # or caller-supplied true value must not bypass route/provider trust.
+        destination_runtime_capabilities["native_compaction"] = (
+            supplied_runtime_capabilities.get("native_compaction") is True
+            and resolved_route_capabilities.get("native_compaction") is True
+        )
+    else:
+        destination_runtime_capabilities = resolved_route_capabilities
 
     # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
     # /v1 into the anthropic_messages client, which would cause the SDK to
@@ -3010,6 +3049,7 @@ def switch_model(
             "_is_anthropic_oauth",
             "_config_context_length",
             "_reasoning_echo_flag",
+            "capabilities",
             "runtime_capabilities",
         )
     }
@@ -3330,7 +3370,8 @@ def switch_model(
 
     # Publish the destination capability map only after every runtime setup
     # above has succeeded. Failed switches must leave the old map intact.
-    agent.runtime_capabilities = destination_capabilities
+    agent.capabilities = destination_provider_capabilities
+    agent.runtime_capabilities = destination_runtime_capabilities
 
     # ── Reset the cross-turn stale-call circuit breaker (#58962) ──
     # The breaker's error text tells the user to "switch models ... then
@@ -3359,6 +3400,7 @@ def switch_model(
         # recovery or fallback restore would resurrect the PRE-switch
         # overrides via the stale init-time snapshot (#75091 seam).
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "capabilities": dict(getattr(agent, "capabilities", {}) or {}),
         "runtime_capabilities": dict(getattr(agent, "runtime_capabilities", {}) or {}),
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
