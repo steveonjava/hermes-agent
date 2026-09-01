@@ -82,8 +82,10 @@ def _get_command_timeout() -> int:
 
 
 def _auth_headers() -> Dict[str, str]:
-    """Return Authorization header when CAMOFOX_API_KEY is set."""
-    key = (get_secret("CAMOFOX_API_KEY", "") or "").strip()
+    """Return the configured bearer header for Camofox requests."""
+    key = (get_secret("CAMOFOX_ACCESS_KEY", "") or "").strip() or (
+        get_secret("CAMOFOX_API_KEY", "") or ""
+    ).strip()
     if key:
         return {"Authorization": f"Bearer {key}"}
     return {}
