@@ -689,12 +689,19 @@ class SasVerificationHandler:
             # here we just verify and finish the exchange.
             if not session.mac_sent:
                 await self._send_our_mac(session)
+            if not session.mac_sent:
+                return
             if not session.done_sent:
-                await self._send(
+                sent = await self._send(
                     "m.key.verification.done",
                     session,
                     {"transaction_id": txid},
                 )
+                if not sent:
+                    logger.warning(
+                        "Matrix: SAS done transport failed; transaction remains incomplete"
+                    )
+                    return
                 session.done_sent = True
             await self._finalize(session)
         except Exception as exc:
@@ -721,11 +728,16 @@ class SasVerificationHandler:
                 await self._cancel(session, "m.unexpected_message", "SAS done before MAC verification")
                 return
             if not session.done_sent:
-                await self._send(
+                sent = await self._send(
                     "m.key.verification.done",
                     session,
                     {"transaction_id": txid},
                 )
+                if not sent:
+                    logger.warning(
+                        "Matrix: SAS done transport failed; transaction remains incomplete"
+                    )
+                    return
                 session.done_sent = True
             await self._finalize(session)
         except Exception as exc:

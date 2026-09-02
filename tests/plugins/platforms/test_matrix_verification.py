@@ -396,3 +396,61 @@ class TestStateMachineSafety:
 
         asyncio.run(h._send_our_mac(session))
         assert session.mac_sent is False
+
+    @staticmethod
+    def _event_for(session):
+        return types.SimpleNamespace(
+            content={"transaction_id": session.transaction_id, "mac": {"k": "v"}},
+            sender=session.other_user,
+            room_id=session.room_id,
+            event_id="$event",
+        )
+
+    def test_on_mac_does_not_finalize_when_done_send_fails(self):
+        h = _make_handler()
+        session = _make_session()
+        session.mac_sent = True
+        h._sessions[session.transaction_id] = session
+        finalized = False
+
+        async def verified(*args, **kwargs):
+            return True
+
+        async def failed_send(*args, **kwargs):
+            return False
+
+        async def finalize(*args, **kwargs):
+            nonlocal finalized
+            finalized = True
+
+        h._verify_user_macs = verified
+        h._send = failed_send
+        h._finalize = finalize
+
+        asyncio.run(h._on_mac(self._event_for(session)))
+        assert session.done_sent is False
+        assert finalized is False
+        assert session.transaction_id in h._sessions
+
+    def test_on_done_does_not_finalize_when_reply_send_fails(self):
+        h = _make_handler()
+        session = _make_session()
+        session.peer_mac_verified = True
+        session.mac_sent = True
+        h._sessions[session.transaction_id] = session
+        finalized = False
+
+        async def failed_send(*args, **kwargs):
+            return False
+
+        async def finalize(*args, **kwargs):
+            nonlocal finalized
+            finalized = True
+
+        h._send = failed_send
+        h._finalize = finalize
+
+        asyncio.run(h._on_done(self._event_for(session)))
+        assert session.done_sent is False
+        assert finalized is False
+        assert session.transaction_id in h._sessions
