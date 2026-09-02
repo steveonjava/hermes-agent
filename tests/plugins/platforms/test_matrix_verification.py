@@ -7,6 +7,7 @@ HKDF info strings for SAS/MAC, transaction-id resolution and session TTL
 expiry.  No network, no mautrix required — stdlib + pytest + mocks only.
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -281,3 +282,74 @@ class TestExpireOldSessions:
         h._sessions = {"t": s}
         h._expire_old_sessions()
         assert "t" in h._sessions
+
+
+class TestStateMachineSafety:
+    def test_finalize_refuses_before_both_macs_complete(self):
+        h = _make_handler()
+        session = _make_session()
+        h._sessions[session.transaction_id] = session
+        asyncio.run(h._finalize(session))
+        assert session.transaction_id in h._sessions
+
+    @staticmethod
+    def _mac_fixture():
+        h = _make_handler()
+        session = _make_session()
+
+        class FakeMac:
+            def calculate_mac_fixed_base64(self, value, info):
+                return f"mac:{value}:{info}"
+
+        class Store:
+            async def get_device(self, user, device):
+                return types.SimpleNamespace(signing_key="DEVICEKEY")
+
+        class Olm:
+            crypto_store = Store()
+
+            async def get_cross_signing_public_keys(self, user):
+                return types.SimpleNamespace(master_key="MASTERKEY")
+
+        session.sas = FakeMac()
+        h._olm = Olm()
+
+        async def no_fetch(session):
+            return None
+
+        h._ensure_user_keys = no_fetch
+        return h, session
+
+    def test_verify_user_macs_rejects_unknown_authenticated_key(self):
+        h, session = self._mac_fixture()
+        info = h._mac_info_for(session, our_side=False)
+        values = {
+            "ed25519:ALICEDEV": "DEVICEKEY",
+            "ed25519:MASTERKEY": "MASTERKEY",
+            "ed25519:UNKNOWN": "UNKNOWNKEY",
+        }
+        macs = {
+            key_id: session.sas.calculate_mac_fixed_base64(value, info + key_id)
+            for key_id, value in values.items()
+        }
+        content = {
+            "mac": macs,
+            "keys": session.sas.calculate_mac_fixed_base64(
+                ",".join(sorted(macs)), info + "KEY_IDS"
+            ),
+        }
+        assert asyncio.run(h._verify_user_macs(session, content)) is False
+
+    def test_verify_user_macs_requires_device_and_master(self):
+        h, session = self._mac_fixture()
+        info = h._mac_info_for(session, our_side=False)
+        key_id = "ed25519:ALICEDEV"
+        content = {
+            "mac": {
+                key_id: session.sas.calculate_mac_fixed_base64(
+                    "DEVICEKEY", info + key_id
+                )
+            },
+            "keys": session.sas.calculate_mac_fixed_base64(key_id, info + "KEY_IDS"),
+        }
+        assert asyncio.run(h._verify_user_macs(session, content)) is False

@@ -191,6 +191,7 @@ class _SasSession:
     chosen_mac: str = _MAC_V2
     mac_sent: bool = False
     done_sent: bool = False
+    peer_mac_verified: bool = False
     created_at: float = field(default_factory=time.time)
     we_initiated: bool = False  # True when *we* sent the request (initiator)
     their_commitment: str = ""  # initiator: commitment from their accept
@@ -481,8 +482,17 @@ class SasVerificationHandler:
             session.last_event_id = event_id or session.last_event_id
             session.their_commitment = str(content.get("commitment") or "")
             chosen = str(content.get("message_authentication_code") or "")
-            if chosen in (_MAC_V2, _MAC_V1):
-                session.chosen_mac = chosen
+            valid_accept = (
+                bool(session.their_commitment)
+                and content.get("key_agreement_protocol") == _KEY_AGREEMENT
+                and content.get("hash") == _HASH
+                and chosen in (_MAC_V2, _MAC_V1)
+                and "emoji" in (content.get("short_authentication_string") or [])
+            )
+            if not valid_accept:
+                await self._cancel(session, "m.unknown_method", "Invalid SAS negotiation")
+                return
+            session.chosen_mac = chosen
 
             # Share our ephemeral key right after accept.
             await self._send(
@@ -672,6 +682,7 @@ class SasVerificationHandler:
             if not mac_ok:
                 await self._cancel(session, "m.key_mismatch", "MAC verification failed")
                 return
+            session.peer_mac_verified = True
 
             # Responder path (default): we send our MACs only after the user's
             # arrive.  Initiator path: we already sent ours in _on_key, so
@@ -706,6 +717,9 @@ class SasVerificationHandler:
                 return
             session.room_id = room_id or session.room_id
             session.last_event_id = event_id or session.last_event_id
+            if not session.peer_mac_verified or not session.mac_sent:
+                await self._cancel(session, "m.unexpected_message", "SAS done before MAC verification")
+                return
             if not session.done_sent:
                 await self._send(
                     "m.key.verification.done",
@@ -926,11 +940,23 @@ class SasVerificationHandler:
                     logger.debug("Matrix: KEY_IDS MAC verify failed: %s", exc)
                     return False
 
-            # Verify every MAC we have a key for.
+            required = {f"ed25519:{session.other_device}"}
+            required.update(
+                key_id for key_id in known if key_id != f"ed25519:{session.other_device}"
+            )
+            if not required.issubset(macs):
+                logger.warning(
+                    "Matrix: peer MACs omitted required keys: %s",
+                    sorted(required - set(macs)),
+                )
+                return False
+
+            # Unknown IDs are not skippable: KEY_IDS authenticates the set.
             for key_id, mac_value in macs.items():
                 public_key = known.get(key_id)
                 if public_key is None:
-                    continue  # unknown key (e.g. another device) — skip
+                    logger.warning("Matrix: peer MAC references unknown key %s", key_id)
+                    return False
                 try:
                     calc = str(mac_func(public_key, info + key_id))
                 except Exception as exc:
@@ -1109,7 +1135,17 @@ class SasVerificationHandler:
         logger.info("Matrix: SAS verification cancelled (%s: %s)", code, reason)
 
     async def _finalize(self, session: _SasSession) -> None:
-        """Mark the verification as complete."""
+        """Complete an exchange after both sides' MACs validate.
+
+        The peer client persists/signs its trust in this device. Hermes does
+        not claim to have cross-signed the peer device here.
+        """
+        if not session.peer_mac_verified or not session.mac_sent:
+            logger.warning(
+                "Matrix: refusing to finalize incomplete SAS transaction %s",
+                session.transaction_id,
+            )
+            return
         self._sessions.pop(session.transaction_id, None)
         logger.info(
             "Matrix: SAS verification with %s completed successfully 🎉",
@@ -1120,8 +1156,8 @@ class SasVerificationHandler:
             try:
                 await self._adapter.send(
                     room_id,
-                    "✅ Verification successful! The device is now marked as "
-                    "verified.",
+                    "✅ SAS verification completed. Your Matrix client can now "
+                    "record trust in this device.",
                 )
             except Exception as exc:
                 logger.debug("Matrix: success notification failed: %s", exc)
