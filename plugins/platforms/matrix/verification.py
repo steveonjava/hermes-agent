@@ -872,7 +872,7 @@ class SasVerificationHandler:
             await self._cancel(session, "m.unexpected_message", "KEY_IDS MAC failed")
             return
 
-        await self._send(
+        sent = await self._send(
             "m.key.verification.mac",
             session,
             {
@@ -881,6 +881,9 @@ class SasVerificationHandler:
                 "transaction_id": session.transaction_id,
             },
         )
+        if not sent:
+            logger.warning("Matrix: SAS MAC transport failed; transaction remains incomplete")
+            return
         session.mac_sent = True
         logger.info(
             "Matrix: SAS MACs sent to %s (keys: %s)", session.other_user, sorted_key_ids
@@ -930,15 +933,17 @@ class SasVerificationHandler:
 
             # Verify the KEY_IDS MAC over the sorted key-id list.
             sorted_key_ids = ",".join(sorted(macs.keys()))
-            if keys_mac_expected:
-                try:
-                    calc = str(mac_func(sorted_key_ids, info + "KEY_IDS"))
-                    if calc != keys_mac_expected:
-                        logger.warning("Matrix: user KEY_IDS MAC mismatch")
-                        return False
-                except Exception as exc:
-                    logger.debug("Matrix: KEY_IDS MAC verify failed: %s", exc)
+            if not keys_mac_expected:
+                logger.warning("Matrix: peer omitted required KEY_IDS MAC")
+                return False
+            try:
+                calc = str(mac_func(sorted_key_ids, info + "KEY_IDS"))
+                if calc != keys_mac_expected:
+                    logger.warning("Matrix: user KEY_IDS MAC mismatch")
                     return False
+            except Exception as exc:
+                logger.debug("Matrix: KEY_IDS MAC verify failed: %s", exc)
+                return False
 
             required = {f"ed25519:{session.other_device}"}
             required.update(
@@ -990,7 +995,7 @@ class SasVerificationHandler:
     # Messaging helpers
     # ------------------------------------------------------------------
 
-    async def _send(self, event_name: str, session: _SasSession, content: Dict[str, Any]) -> None:
+    async def _send(self, event_name: str, session: _SasSession, content: Dict[str, Any]) -> bool:
         """Send a verification event via the session's transport.
 
         In-room sessions (MSC 2241) send timeline events chained via
@@ -998,9 +1003,8 @@ class SasVerificationHandler:
         everything else uses classic to-device messages.
         """
         if session.room_id:
-            await self._send_room_event(event_name, session, content)
-        else:
-            await self._send_to_device(event_name, session, content)
+            return await self._send_room_event(event_name, session, content) is not None
+        return await self._send_to_device(event_name, session, content)
 
     async def _send_room_event(
         self, event_name: str, session: _SasSession, content: Dict[str, Any]
@@ -1047,7 +1051,7 @@ class SasVerificationHandler:
             logger.warning("Matrix: send room event %s failed: %s", event_name, exc)
             return None
 
-    async def _send_to_device(self, event_name: str, session: _SasSession, content: Dict[str, Any]) -> None:
+    async def _send_to_device(self, event_name: str, session: _SasSession, content: Dict[str, Any]) -> bool:
         from mautrix.types import EventType
 
         evt_type = EventType.find(event_name, EventType.Class.TO_DEVICE)
@@ -1060,8 +1064,10 @@ class SasVerificationHandler:
                 evt_type,
                 {session.other_user: {session.other_device: content}},
             )
+            return True
         except Exception as exc:
             logger.warning("Matrix: send_to_device %s failed: %s", event_name, exc)
+            return False
 
     async def _post_emojis(self, session: _SasSession, emojis: list[tuple[str, str]]) -> None:
         """Post the emoji short-auth-string into the DM for comparison."""

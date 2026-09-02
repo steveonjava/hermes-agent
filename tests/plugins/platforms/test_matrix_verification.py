@@ -353,3 +353,46 @@ class TestStateMachineSafety:
             "keys": session.sas.calculate_mac_fixed_base64(key_id, info + "KEY_IDS"),
         }
         assert asyncio.run(h._verify_user_macs(session, content)) is False
+
+    def test_verify_user_macs_requires_key_ids_mac(self):
+        h, session = self._mac_fixture()
+        info = h._mac_info_for(session, our_side=False)
+        values = {
+            "ed25519:ALICEDEV": "DEVICEKEY",
+            "ed25519:MASTERKEY": "MASTERKEY",
+        }
+        content = {
+            "mac": {
+                key_id: session.sas.calculate_mac_fixed_base64(value, info + key_id)
+                for key_id, value in values.items()
+            }
+        }
+        assert asyncio.run(h._verify_user_macs(session, content)) is False
+
+    def test_send_our_mac_does_not_advance_on_transport_failure(self):
+        h = _make_handler()
+        session = _make_session()
+
+        class FakeMac:
+            def calculate_mac_fixed_base64(self, value, info):
+                return f"mac:{value}:{info}"
+
+        class Account:
+            identity_keys = {"ed25519": "BOTKEY"}
+
+        class Olm:
+            account = Account()
+
+            async def get_own_cross_signing_public_keys(self):
+                return None
+
+        async def failed_send(*args, **kwargs):
+            return False
+
+        session.sas = FakeMac()
+        session.chosen_mac = "hkdf-hmac-sha256.v2"
+        h._olm = Olm()
+        h._send = failed_send
+
+        asyncio.run(h._send_our_mac(session))
+        assert session.mac_sent is False
