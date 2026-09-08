@@ -461,6 +461,30 @@ class TestMatrixReplyFallbackStripping:
 # Matrix-friendly command aliases
 # ---------------------------------------------------------------------------
 
+class TestMatrixSasVerificationCommand:
+    @pytest.mark.asyncio
+    async def test_verify_command_starts_after_message_context_resolves(self):
+        adapter = _make_adapter()
+        adapter._text_batch_delay_seconds = 0
+        adapter._resolve_message_context = AsyncMock(return_value=(
+            "!verify", True, "direct", None, "Alice", {"user_id": "@alice:example.org"},
+        ))
+        adapter.handle_message = AsyncMock()
+        adapter._sas_verification = types.SimpleNamespace(
+            start_verification=AsyncMock(return_value=True),
+        )
+        adapter._send_simple_message = AsyncMock()
+
+        await adapter._handle_text_message(
+            "!dm:example.org", "@alice:example.org", "$verify", 0.0,
+            {"msgtype": "m.text", "body": "!verify"}, {},
+        )
+
+        adapter._sas_verification.start_verification.assert_awaited_once_with(
+            "@alice:example.org", "!dm:example.org",
+        )
+        adapter.handle_message.assert_not_awaited()
+
 class TestMatrixBangCommandAlias:
     """Matrix clients may reserve /commands, so Hermes supports !commands."""
 
@@ -1267,6 +1291,46 @@ class TestMatrixDeviceIdConfig:
 
 
 class TestMatrixSyncLoop:
+
+
+    @pytest.mark.asyncio
+    async def test_dispatches_decrypted_verification_to_device_event(self):
+        """Olm-wrapped SAS events must reach the verification handler."""
+        adapter = _make_adapter()
+        dispatched = []
+
+        class ToDeviceEvent:
+            @staticmethod
+            def deserialize(raw_event):
+                return raw_event
+
+        fake_mautrix = _make_fake_mautrix()
+        fake_mautrix["mautrix.types"].ToDeviceEvent = ToDeviceEvent
+        fake_mautrix["mautrix.types"].EventType.ROOM_KEY = "m.room_key"
+        fake_mautrix["mautrix.types"].EventType.FORWARDED_ROOM_KEY = "m.forwarded_room_key"
+        syncer = types.ModuleType("mautrix.client.syncer")
+        syncer.SyncStream = types.SimpleNamespace(TO_DEVICE="to_device")
+        fake_mautrix["mautrix.client.syncer"] = syncer
+
+        class DecryptedEvent:
+            type = "m.key.verification.request"
+            sender = "@alice:example.org"
+
+        class Crypto:
+            async def _decrypt_olm_event(self, event):
+                return DecryptedEvent()
+
+        adapter._client = types.SimpleNamespace(
+            crypto=Crypto(),
+            dispatch_event=lambda event, source: dispatched.append((event, source)) or [],
+        )
+
+        with patch.dict("sys.modules", fake_mautrix):
+            await adapter._dispatch_sas_to_device_events({
+                "to_device": {"events": [{"type": "m.room.encrypted", "sender": "@alice:example.org", "content": {}}]}
+            })
+
+        assert dispatched and dispatched[0][0].type == "m.key.verification.request"
 
 
     @pytest.mark.asyncio

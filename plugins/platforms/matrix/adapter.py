@@ -853,6 +853,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
         self._store_dir: Optional[Path] = None  # pinned per profile in connect()
         self._sync_task: Optional[asyncio.Task] = None
+        self._sas_verification: Any = None
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
         self._startup_ts: float = 0.0
@@ -1339,6 +1340,17 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
         if self._encryption and not await self._connect_setup_e2ee(client, api, state_store):
             return False
+        if self._encryption and getattr(client, "crypto", None) is not None:
+            try:
+                from .verification import SasVerificationHandler
+
+                self._sas_verification = SasVerificationHandler(self, client, client.crypto)
+                self._sas_verification.register()
+            except Exception as exc:
+                logger.warning("Matrix: SAS verification handler could not be enabled: %s", exc)
+                self._sas_verification = None
+        else:
+            self._sas_verification = None
         from mautrix.client import InternalEventType as IntEvt
         from mautrix.client.dispatcher import MembershipEventDispatcher
         client.add_dispatcher(MembershipEventDispatcher)  # without this INVITE never fires
@@ -1417,6 +1429,19 @@ class MatrixAdapter(BasePlatformAdapter):
         event_id = await asyncio.wait_for(
             self._client.send_message_event(RoomID(chat_id), EventType.ROOM_MESSAGE, msg_content), timeout=45)
         return str(event_id)
+
+    async def _send_simple_message(self, chat_id: str, text: str, msgtype: str) -> SendResult:
+        """Send a notice or emote without invoking normal response formatting."""
+        if not self._client or not text:
+            return SendResult(success=False, error="No client or empty text")
+        try:
+            event_id = await self._client.send_message_event(
+                RoomID(chat_id), EventType.ROOM_MESSAGE,
+                self._build_text_message_content(text, msgtype=msgtype),
+            )
+            return SendResult(success=True, message_id=str(event_id))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         identity = await self._resolve_room_identity(chat_id)
@@ -1874,15 +1899,58 @@ class MatrixAdapter(BasePlatformAdapter):
         client = self._client
         if not client or not hasattr(client, "handle_sync"):
             return
+        sas_tasks = await self._dispatch_sas_to_device_events(sync_data)
         tasks = client.handle_sync(sync_data)
         if inspect.isawaitable(tasks):
             tasks = await tasks
+        if sas_tasks:
+            tasks = list(tasks or []) + sas_tasks
         if tasks:
             # return_exceptions=True: one failing handler must not drop its SIBLING events.
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception):
                     logger.warning("Matrix: event handler failed during sync dispatch: %s", result)
+
+    async def _dispatch_sas_to_device_events(self, sync_data: Dict[str, Any]) -> list:
+        """Decrypt and dispatch non-key Olm to-device events for SAS verification."""
+        client = self._client
+        crypto = getattr(client, "crypto", None)
+        raw_events = (sync_data.get("to_device") or {}).get("events") or []
+        if crypto is None or not raw_events:
+            return []
+        try:
+            from mautrix.client.syncer import SyncStream
+            from mautrix.types import EventType, ToDeviceEvent
+            source = SyncStream.TO_DEVICE
+            room_key = EventType.ROOM_KEY
+            forwarded_room_key = EventType.FORWARDED_ROOM_KEY
+        except ImportError:
+            ToDeviceEvent = None
+            source = "to_device"
+            room_key = "m.room_key"
+            forwarded_room_key = "m.forwarded_room_key"
+        remaining = []
+        tasks = []
+        for raw_event in raw_events:
+            if str(raw_event.get("type") or "") != "m.room.encrypted":
+                remaining.append(raw_event)
+                continue
+            try:
+                event = ToDeviceEvent.deserialize(raw_event) if ToDeviceEvent else raw_event
+                decrypted = await crypto._decrypt_olm_event(event)
+            except Exception as exc:
+                logger.debug("Matrix: Olm to-device decrypt failed: %s", exc)
+                remaining.append(raw_event)
+                continue
+            if decrypted.type == room_key:
+                await crypto._receive_room_key(decrypted)
+            elif decrypted.type == forwarded_room_key:
+                await crypto._receive_forwarded_room_key(decrypted)
+            else:
+                tasks.extend(client.dispatch_event(decrypted, source=source) or [])
+        (sync_data.get("to_device") or {})["events"] = remaining
+        return tasks
 
     def _is_self_sender(self, sender: str) -> bool:
         """True if *sender* is the bot itself (case-insensitive: homeservers vary localpart case). With
@@ -2082,6 +2150,13 @@ class MatrixAdapter(BasePlatformAdapter):
         """Gate + normalise an inbound event into a MessageEvent (None => drop). Text body may
         still change (reply-fallback strip); ``extra`` carries media fields / message_type."""
         ctx = await self._resolve_message_context(room_id, sender, event_id, body, source_content, relates_to)
+        return await self._build_inbound_event_from_context(
+            room_id, sender, event_id, body, source_content, relates_to, ctx, **extra)
+
+    async def _build_inbound_event_from_context(
+        self, room_id: str, sender: str, event_id: str, body: str, source_content: dict, relates_to: dict,
+        ctx: Optional[tuple], **extra) -> Optional[MessageEvent]:
+        """Build an inbound event from already-resolved routing context."""
         if ctx is None:
             return None
         body, _is_dm, _chat_type, _thread_id, display_name, source = ctx
@@ -2107,8 +2182,25 @@ class MatrixAdapter(BasePlatformAdapter):
         body = source_content.get("body", "") or ""
         if not body:
             return
-        msg_event = await self._build_inbound_event(
-            room_id, sender, event_id, _normalize_matrix_bang_command(body), source_content, relates_to)
+        body = _normalize_matrix_bang_command(body)
+        context = await self._resolve_message_context(room_id, sender, event_id, body, source_content, relates_to)
+        if context is None:
+            return
+        body, _is_dm, _chat_type, _thread_id, _display_name, _source = context
+        if self._sas_verification is not None and body.strip().lower() in {"!verify", "verify", "!verify device"}:
+            try:
+                started = await self._sas_verification.start_verification(sender, room_id)
+                notice = (
+                    "Device verification started. Check your Matrix client and compare the emojis."
+                    if started else "Verification could not be started (no DM room found)."
+                )
+                await self._send_simple_message(room_id, notice, "m.notice")
+            except Exception as exc:
+                logger.warning("Matrix: !verify failed: %s", exc)
+                await self._send_simple_message(room_id, f"Verification failed: {exc}", "m.notice")
+            return
+        msg_event = await self._build_inbound_event_from_context(
+            room_id, sender, event_id, body, source_content, relates_to, context)
         if msg_event is None:
             return
         if msg_event.message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
