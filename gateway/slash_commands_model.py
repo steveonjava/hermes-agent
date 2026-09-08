@@ -216,7 +216,8 @@ class GatewayModelCommandsMixin:
             cached_agent.switch_model(
                 new_model=result.new_model, new_provider=result.target_provider,
                 api_key=result.api_key, base_url=result.base_url, api_mode=result.api_mode,
-                capabilities=getattr(result, "runtime_capabilities", None),
+                provider_capabilities=getattr(result, "provider_capabilities", None),
+                runtime_capabilities=getattr(result, "runtime_capabilities", None),
             )
         except Exception as exc:
             logger.warning(
@@ -264,7 +265,7 @@ class GatewayModelCommandsMixin:
             "model": result.new_model, "provider": result.target_provider, "api_key": result.api_key,
             "base_url": result.base_url, "api_mode": result.api_mode,
             "request_overrides": dict(result.request_overrides or {}),
-            "capabilities": dict(result.runtime_capabilities or {}),
+            "capabilities": dict(result.provider_capabilities or {}),
         }
         if one_turn:
             if not hasattr(self, "_pending_one_turn_model_restores"):

@@ -5,6 +5,7 @@ time (method_ctx.bind_module), so they reference server.py globals bare."""
 from __future__ import annotations
 
 import contextlib
+import copy
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -28,6 +29,8 @@ _RUNTIME_KEYS = ("model", "provider", "api_key", "base_url", "api_mode")
 def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
+            "provider_capabilities": copy.deepcopy(getattr(agent, "capabilities", {}) or {}),
+            "runtime_capabilities": copy.deepcopy(getattr(agent, "runtime_capabilities", {}) or {}),
             "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None))}
 
 
@@ -49,7 +52,9 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         model, provider, api_key, base_url, api_mode = (snapshot.get(k, "") for k in _RUNTIME_KEYS)
         agent.switch_model(
             new_model=model, new_provider=provider, api_key=api_key, base_url=base_url,
-            api_mode=api_mode, capabilities=snapshot.get("capabilities"))
+            api_mode=api_mode,
+            provider_capabilities=snapshot.get("provider_capabilities"),
+            runtime_capabilities=snapshot.get("runtime_capabilities"))
 
 
 @contextlib.contextmanager
@@ -172,9 +177,10 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
     """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts."""
     try:
         agent.switch_model(
-            new_model=result.new_model, new_provider=result.target_provider, api_key=result.api_key,
-            base_url=result.base_url, api_mode=result.api_mode,
-            capabilities=getattr(result, "runtime_capabilities", None))
+            new_model=result.new_model, new_provider=result.target_provider,
+            api_key=result.api_key, base_url=result.base_url, api_mode=result.api_mode,
+            provider_capabilities=getattr(result, "provider_capabilities", None),
+            runtime_capabilities=getattr(result, "runtime_capabilities", None))
     except Exception as exc:
         # The in-place swap rolled the agent back and re-raised. Abort the whole commit (worker
         # restart, persist, marker, override, config write) or the session pins a broken model.
@@ -208,6 +214,7 @@ def _apply_model_switch(
         raise ValueError("/model --once requires a live session")
     current_provider, current_model, current_base_url, current_api_key = _current_model_runtime(
         agent, explicit_provider)
+    current_provider_capabilities = dict(getattr(agent, "capabilities", {}) or {}) if agent else {}
     # User-defined providers let switch_model resolve named custom endpoints
     # (e.g. "ollama-launch") and validate against saved model lists.
     user_provs = custom_provs = cfg = None
@@ -218,7 +225,8 @@ def _apply_model_switch(
         custom_provs = get_compatible_custom_providers(cfg)
     result = switch_model(
         raw_input=model_input, current_provider=current_provider, current_model=current_model,
-        current_base_url=current_base_url, current_api_key=current_api_key, is_global=persist_global,
+        current_base_url=current_base_url, current_api_key=current_api_key,
+        current_provider_capabilities=current_provider_capabilities, is_global=persist_global,
         explicit_provider=explicit_provider, user_providers=user_provs,
         custom_providers=custom_provs)
     if not result.success:
@@ -238,7 +246,8 @@ def _apply_model_switch(
     if pin_session_override and isinstance(session, dict) and not one_turn:
         session["model_override"] = {
             "model": result.new_model, "provider": result.target_provider,
-            "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode}
+            "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode,
+            "capabilities": dict(getattr(result, "provider_capabilities", None) or {})}
     if persist_global:
         _persist_model_switch(result)
     return {

@@ -82,6 +82,7 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
             current_model=cli.model or "",
             current_base_url=cli.base_url or "",
             current_api_key=cli.api_key or "",
+            current_provider_capabilities=getattr(cli, "capabilities", None),
             is_global=False,
             explicit_provider=_config_provider or "")
         if not r.success:
@@ -90,10 +91,12 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
             cli.agent.switch_model(
                 new_model=r.new_model, new_provider=r.target_provider, api_key=r.api_key,
                 base_url=r.base_url, api_mode=r.api_mode,
-                capabilities=getattr(r, "runtime_capabilities", None))
+                provider_capabilities=getattr(r, "provider_capabilities", None),
+                runtime_capabilities=getattr(r, "runtime_capabilities", None))
         cli.model = r.new_model
         cli.provider = r.target_provider
         cli.requested_provider = r.target_provider
+        cli.capabilities = dict(getattr(r, "provider_capabilities", None) or {})
         cli._explicit_api_key = r.api_key
         cli._explicit_base_url = r.base_url
         if r.api_key:

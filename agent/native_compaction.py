@@ -34,12 +34,17 @@ def is_native_compaction_model(model: Optional[str]) -> bool:
 
 def resolve_native_compaction_capabilities(
     *, model: Optional[str], base_url: Optional[str], provider: Optional[str] = None, is_codex_backend: bool = False,
+    provider_capabilities: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, bool]:
     """Resolve the native-compaction capability for a runtime destination (a resolved ``False``
     is distinct from "unresolved" and must survive model switches unchanged)."""
     direct_default = (provider or "").strip().lower() == "openai" and not base_url
+    trusted_proxy = (
+        isinstance(provider_capabilities, dict)
+        and provider_capabilities.get("openai_native_compaction") is True
+    )
     return {"native_compaction": is_native_compaction_model(model) and (
-        direct_default or is_direct_openai_route(base_url, is_codex_backend=is_codex_backend))}
+        direct_default or is_direct_openai_route(base_url, is_codex_backend=is_codex_backend) or trusted_proxy)}
 
 
 def is_direct_openai_route(base_url: Optional[str], *, is_codex_backend: bool = False) -> bool:
@@ -105,7 +110,7 @@ def native_compaction_context_management(agent: Any, *, is_codex_backend: bool, 
     kill switch (``agent.codex_responses_native_compaction = False``) takes effect next call.
     """
     capabilities = getattr(agent, "runtime_capabilities", None)
-    if isinstance(capabilities, dict) and not capabilities.get("native_compaction", False):
+    if isinstance(capabilities, dict) and capabilities.get("native_compaction") is not True:
         return None
     # compression.enabled: false disables ALL automatic compaction, native included.
     if not getattr(agent, "codex_responses_native_compaction", False) or not getattr(agent, "compression_enabled", True):
@@ -118,7 +123,7 @@ def native_compaction_context_management(agent: Any, *, is_codex_backend: bool, 
         return None
     if is_xai_responses or is_github_responses or not is_native_compaction_model(getattr(agent, "model", None)):
         return None
-    trusted_proxy = bool(getattr(agent, "capabilities", {}).get("openai_native_compaction", False))
+    trusted_proxy = getattr(agent, "capabilities", {}).get("openai_native_compaction") is True
     if not trusted_proxy and not is_direct_openai_route(getattr(agent, "base_url", None), is_codex_backend=is_codex_backend):
         return None
 

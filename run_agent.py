@@ -458,7 +458,17 @@ class AIAgent(
             self.model, self.base_url, getattr(self, "api_key", ""), config_context_length, return_load_result=True,
         )
 
-    switch_model = _forward("agent.agent_runtime_helpers", "switch_model")
+    def switch_model(
+        self, new_model, new_provider, api_key="", base_url="", api_mode="",
+        capabilities=None, provider_capabilities=None, runtime_capabilities=None,
+    ):
+        """Lazily forward a live model switch without erasing its public signature."""
+        return _forward("agent.agent_runtime_helpers", "switch_model")(
+            self, new_model, new_provider, api_key, base_url, api_mode,
+            capabilities=capabilities,
+            provider_capabilities=provider_capabilities,
+            runtime_capabilities=runtime_capabilities,
+        )
 
     def _disable_codex_reasoning_replay(self, messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, int]:
         """On HTTP 400 ``invalid_encrypted_content``: disable Responses reasoning replay and pop

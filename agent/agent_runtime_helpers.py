@@ -890,6 +890,9 @@ def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
     if hasattr(agent, "_transport_cache"):
         agent._transport_cache.clear()
     agent.api_key = rt["api_key"]
+    raw_provider_capabilities = rt.get("capabilities", {})
+    if isinstance(raw_provider_capabilities, dict):
+        agent.capabilities = dict(raw_provider_capabilities)
     agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
     agent.request_overrides = dict(rt.get("request_overrides") or {})
     agent._client_kwargs = dict(rt["client_kwargs"])
@@ -1791,7 +1794,7 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
 _SWITCH_SNAPSHOT_FIELDS = (
     "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
     "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
-    "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
+    "_config_context_length", "_reasoning_echo_flag", "capabilities", "runtime_capabilities",
     "_credential_pool", "_credential_pool_entry_id",
 )
 _MISSING = object()
@@ -1815,8 +1818,9 @@ def _restore_switch_snapshot(agent, snapshot: Dict[str, Any]) -> None:
             setattr(agent, name, value)
 
 
-def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm):
-    """Resolve ``(api_mode, base_url, destination_capabilities)`` for the switch target."""
+def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mode, capabilities,
+                                provider_capabilities, runtime_capabilities, old_norm, new_norm):
+    """Resolve ``(api_mode, base_url, provider, runtime capabilities)`` for the switch target."""
     from hermes_cli.providers import determine_api_mode
     from agent.native_compaction import resolve_native_compaction_capabilities
     from hermes_cli.models import opencode_provider_family
@@ -1831,14 +1835,29 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
     effective_base_url = base_url
     if not effective_base_url and old_norm == new_norm:
         effective_base_url = getattr(agent, "base_url", "")
-    destination_capabilities = (
-        dict(capabilities)
-        if isinstance(capabilities, dict)
-        else resolve_native_compaction_capabilities(
-            model=new_model, base_url=effective_base_url, provider=new_provider,
-            is_codex_backend=new_norm == "openai-codex",
-        )
+    destination_provider_capabilities = (
+        {key: value for key, value in provider_capabilities.items()
+         if isinstance(key, str) and isinstance(value, bool)}
+        if isinstance(provider_capabilities, dict) else {})
+    supplied_runtime_capabilities = None
+    if isinstance(runtime_capabilities, dict):
+        supplied_runtime_capabilities = dict(runtime_capabilities)
+    elif provider_capabilities is None and isinstance(capabilities, dict):
+        supplied_runtime_capabilities = dict(capabilities)
+        if old_norm == new_norm:
+            destination_provider_capabilities = dict(getattr(agent, "capabilities", {}) or {})
+    resolved_route_capabilities = resolve_native_compaction_capabilities(
+        model=new_model, base_url=effective_base_url, provider=new_provider,
+        is_codex_backend=new_norm == "openai-codex",
+        provider_capabilities=destination_provider_capabilities,
     )
+    if supplied_runtime_capabilities is not None:
+        destination_runtime_capabilities = supplied_runtime_capabilities
+        destination_runtime_capabilities["native_compaction"] = (
+            supplied_runtime_capabilities.get("native_compaction") is True
+            and resolved_route_capabilities.get("native_compaction") is True)
+    else:
+        destination_runtime_capabilities = resolved_route_capabilities
     # Guard against a trailing /v1 on OpenCode base_url reaching the anthropic_messages client
     # (double-/v1 404); model_switch already strips it, direct callers may not.
     if (
@@ -1848,7 +1867,7 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
         and base_url
     ):
         base_url = re.sub(r"/v1/?$", "", base_url)
-    return api_mode, base_url, destination_capabilities
+    return api_mode, base_url, destination_provider_capabilities, destination_runtime_capabilities
 
 
 def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm) -> None:
@@ -2044,6 +2063,7 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
         # PRE-switch overrides from the stale init snapshot.
         # See #75091.
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "capabilities": dict(getattr(agent, "capabilities", {}) or {}),
         "runtime_capabilities": dict(getattr(agent, "runtime_capabilities", {}) or {}),
         "compressor_model": getattr(cc, "model", agent.model),
         "compressor_base_url": getattr(cc, "base_url", agent.base_url),
@@ -2102,7 +2122,8 @@ def _persist_switch_billing_route(agent) -> None:
 
 
 def switch_model(
-    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None
+    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None,
+    provider_capabilities=None, runtime_capabilities=None,
 ):
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
@@ -2118,8 +2139,9 @@ def switch_model(
     # swallowed: the switch itself must still complete.
     old_norm = (old_provider or "").strip().lower()
     new_norm = (new_provider or "").strip().lower()
-    api_mode, base_url, destination_capabilities = _resolve_switch_destination(
-        agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm
+    api_mode, base_url, destination_provider_capabilities, destination_runtime_capabilities = _resolve_switch_destination(
+        agent, new_model, new_provider, base_url, api_mode, capabilities,
+        provider_capabilities, runtime_capabilities, old_norm, new_norm
     )
     snapshot = _snapshot_switch_state(agent)
     try:
@@ -2154,7 +2176,8 @@ def switch_model(
     agent._cached_system_prompt = None
     # Publish the destination capability map only after every runtime setup above has succeeded.
     # Failed switches must leave the old map intact.
-    agent.runtime_capabilities = destination_capabilities
+    agent.capabilities = destination_provider_capabilities
+    agent.runtime_capabilities = destination_runtime_capabilities
     # Reset the cross-turn stale-call circuit breaker; otherwise the latched streak keeps
     # short-circuiting the freshly selected healthy provider.
     from agent.chat_completion_helpers import _reset_stale_streak

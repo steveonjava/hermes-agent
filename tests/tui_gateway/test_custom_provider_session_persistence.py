@@ -156,6 +156,37 @@ class TestResumeRoundTrip:
         assert kwargs["base_url"] == MIMO_URL
         assert kwargs["api_key"] == MIMO_KEY
 
+    def test_restart_resume_rehydrates_trusted_proxy_capability(self, monkeypatch):
+        config = {
+            "model": {
+                "default": "gpt-5.6-sol-chatgpt-tier",
+                "provider": "custom:trusted-proxy",
+            },
+            "custom_providers": [
+                {
+                    "name": "trusted-proxy",
+                    "base_url": "https://trusted-proxy.example/v1",
+                    "api_key": "sk-test",
+                    "api_mode": "codex_responses",
+                    "model": "gpt-5.6-sol-chatgpt-tier",
+                    "capabilities": {"openai_native_compaction": True},
+                }
+            ],
+        }
+        override = {
+            "model": "gpt-5.6-sol-chatgpt-tier",
+            "provider": "custom:trusted-proxy",
+            "base_url": "https://trusted-proxy.example/v1",
+            "api_mode": "codex_responses",
+        }
+
+        kwargs = _make_agent_with_override(
+            override, monkeypatch, config, model_cfg=config["model"]
+        )
+
+        assert kwargs["requested_provider"] == "custom:trusted-proxy"
+        assert kwargs["capabilities"] == {"openai_native_compaction": True}
+
     def test_legacy_row_with_bare_custom_heals_via_base_url(self, monkeypatch):
         """Rows persisted BEFORE the fix stored provider="custom"; the
         rebuild must recover the entry identity from the stored base_url."""

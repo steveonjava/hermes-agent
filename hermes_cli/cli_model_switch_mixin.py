@@ -21,7 +21,7 @@ from utils import base_url_host_matches
 # override and restored wholesale on rollback.
 _RUNTIME_FIELDS = (
     "model", "provider", "requested_provider", "_explicit_api_key", "_explicit_base_url",
-    "api_key", "base_url", "api_mode")
+    "api_key", "base_url", "api_mode", "capabilities")
 
 
 def _runtime_fields(cli) -> dict:
@@ -119,7 +119,8 @@ def _switch_model_from(
     from hermes_cli.model_switch import switch_model
     return switch_model(
         raw_input=raw_input, current_provider=cli.provider or "", current_model=cli.model or "",
-        current_base_url=cli.base_url or "", current_api_key=cli.api_key or "", is_global=is_global,
+        current_base_url=cli.base_url or "", current_api_key=cli.api_key or "",
+        current_provider_capabilities=getattr(cli, "capabilities", None), is_global=is_global,
         explicit_provider=explicit_provider, user_providers=user_providers,
         custom_providers=custom_providers)
 
@@ -373,6 +374,7 @@ class CLIModelSwitchMixin:
             if stored_api_mode:
                 self.api_mode = stored_api_mode
         if provider_changed:
+            resume_provider_capabilities: dict[str, bool] = {}
             # Launch-time explicit overrides belong to the AMBIENT provider and would poison
             # _ensure_runtime_credentials for the restored one. api_key is never persisted to
             # the session DB — runtime provider resolution owns credentials.
@@ -388,18 +390,32 @@ class CLIModelSwitchMixin:
                     self.base_url = resolved["base_url"]
                 if not stored_api_mode and resolved.get("api_mode"):
                     self.api_mode = resolved["api_mode"]
+                raw_capabilities = resolved.get("capabilities")
+                if isinstance(raw_capabilities, dict):
+                    resume_provider_capabilities = {key: value for key, value in raw_capabilities.items()
+                                                    if isinstance(key, str) and isinstance(value, bool)}
             except Exception:
                 logger.debug(
                     "Credential re-resolution for resumed session provider "
                     "%s failed; keeping ambient credentials",
                     stored_provider, exc_info=True)
+        else:
+            raw_capabilities = getattr(self.agent, "capabilities", {})
+            resume_provider_capabilities = dict(raw_capabilities) if isinstance(raw_capabilities, dict) else {}
         # Mid-chat /resume swaps the live agent; on startup --resume _init_agent picks up
         # self.model / self.provider.
         if self.agent is not None:
             try:
+                from agent.native_compaction import resolve_native_compaction_capabilities
+                resume_runtime_capabilities = resolve_native_compaction_capabilities(
+                    model=self.model, base_url=self.base_url, provider=self.provider,
+                    is_codex_backend=(self.provider or "").strip().lower() == "openai-codex",
+                    provider_capabilities=resume_provider_capabilities)
                 self.agent.switch_model(
                     new_model=self.model, new_provider=self.provider, api_key=self.api_key or "",
-                    base_url=self.base_url or "", api_mode=self.api_mode or "")
+                    base_url=self.base_url or "", api_mode=self.api_mode or "",
+                    provider_capabilities=resume_provider_capabilities,
+                    runtime_capabilities=resume_runtime_capabilities)
             except Exception:
                 logger.debug("In-place agent model swap on resume failed", exc_info=True)
         msg = f"Model restored from session: {stored_model}"
@@ -499,7 +515,8 @@ class CLIModelSwitchMixin:
                     new_model=snapshot.get("model", ""), new_provider=snapshot.get("provider", ""),
                     api_key=snapshot.get("api_key", ""), base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
-                    capabilities=snapshot.get("capabilities"))
+                    provider_capabilities=snapshot.get("capabilities"),
+                    runtime_capabilities=getattr(agent, "runtime_capabilities", None))
             except Exception as exc:
                 logger.warning("CLI one-turn model restore failed: %s", exc)
 
@@ -582,7 +599,8 @@ class CLIModelSwitchMixin:
                 self.agent.switch_model(
                     new_model=result.new_model, new_provider=result.target_provider,
                     api_key=result.api_key, base_url=result.base_url, api_mode=result.api_mode,
-                    capabilities=getattr(result, "runtime_capabilities", None))
+                    provider_capabilities=getattr(result, "provider_capabilities", None),
+                    runtime_capabilities=getattr(result, "runtime_capabilities", None))
             except Exception as exc:
                 # The agent rolled itself back to the old working model/client. Roll the CLI's own staged
                 # fields back too and abort the rest of the commit (note + success print) so a failed switch

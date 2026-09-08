@@ -102,6 +102,19 @@ class TestRequestGate:
         )
         assert payload is not None
 
+    @pytest.mark.parametrize("malformed", ["true", 1, [], {"enabled": True}])
+    def test_malformed_trusted_proxy_capability_stays_denied(self, malformed):
+        assert (
+            native_compaction_context_management(
+                _agent(
+                    base_url="https://untrusted-proxy.example/v1",
+                    capabilities={"openai_native_compaction": malformed},
+                ),
+                is_codex_backend=False,
+            )
+            is None
+        )
+
     def test_disabled_by_default_config_value(self):
         assert (
             native_compaction_context_management(
@@ -109,6 +122,25 @@ class TestRequestGate:
             )
             is None
         )
+
+    def test_provider_rejection_downgrade_disables_native_only(self):
+        agent = _agent(
+            base_url="https://trusted-proxy.example/v1",
+            capabilities={"openai_native_compaction": True},
+        )
+        agent.runtime_capabilities = {"native_compaction": True}
+        assert native_compaction_context_management(
+            agent, is_codex_backend=False
+        ) is not None
+
+        # The conversation loop performs this one-shot session downgrade after
+        # a structured context_management rejection.
+        agent.codex_responses_native_compaction = False
+
+        assert native_compaction_context_management(
+            agent, is_codex_backend=False
+        ) is None
+        assert agent.compression_enabled is True
 
     def test_compression_disabled_disables_native(self):
         assert (

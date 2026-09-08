@@ -437,6 +437,7 @@ class ModelSwitchResult:
     provider_label: str = ""
     resolved_via_alias: str = ""
     capabilities: Optional[ModelCapabilities] = None
+    provider_capabilities: Optional[dict[str, bool]] = None
     runtime_capabilities: Optional[dict[str, bool]] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
@@ -1042,6 +1043,7 @@ class _Switch:
     explicit_provider: str
     user_providers: Optional[dict]
     custom_providers: Optional[list]
+    current_provider_capabilities: Optional[dict[str, bool]] = None
     new_model: str = ""
     target_provider: str = ""
     resolved_alias: str = ""
@@ -1425,9 +1427,22 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
 
     capabilities = get_model_capabilities(st.target_provider, st.new_model, allow_network=True)
     from agent.native_compaction import resolve_native_compaction_capabilities
+    provider_capabilities = {}
+    if (st.target_provider or "").strip().lower() == (st.current_provider or "").strip().lower():
+        provider_capabilities = dict(st.current_provider_capabilities or {})
+    if not provider_capabilities:
+        for entry in st.custom_providers or []:
+            if not isinstance(entry, dict) or str(entry.get("base_url") or "").rstrip("/") != st.base_url.rstrip("/"):
+                continue
+            raw = entry.get("capabilities")
+            if isinstance(raw, dict):
+                provider_capabilities = {key: value for key, value in raw.items()
+                                         if isinstance(key, str) and isinstance(value, bool)}
+            break
     runtime_capabilities = resolve_native_compaction_capabilities(
         model=st.new_model, base_url=st.base_url, provider=st.target_provider,
-        is_codex_backend=st.target_provider.strip().lower() == "openai-codex")
+        is_codex_backend=st.target_provider.strip().lower() == "openai-codex",
+        provider_capabilities=provider_capabilities)
     model_info = get_model_info(st.target_provider, st.new_model, allow_network=True)
 
     warnings = [w for w in (st.validation.get("message"), _check_hermes_model_warning(st.new_model)) if w]
@@ -1446,6 +1461,7 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
         provider_changed=st.provider_changed, api_key=st.api_key, base_url=st.base_url, api_mode=st.api_mode,
         request_overrides=dict(request_overrides or {}), warning_message=" | ".join(warnings) if warnings else "",
         provider_label=st.provider_label, resolved_via_alias=st.resolved_alias, capabilities=capabilities,
+        provider_capabilities=provider_capabilities,
         runtime_capabilities={
             k: v for k, v in runtime_capabilities.items() if isinstance(k, str) and isinstance(v, bool)},
         model_info=model_info, is_global=st.is_global)
@@ -1453,7 +1469,8 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
 
 def switch_model(
     raw_input: str, current_provider: str, current_model: str, current_base_url: str = "",
-    current_api_key: str = "", is_global: bool = False, explicit_provider: str = "",
+    current_api_key: str = "", current_provider_capabilities: Optional[dict[str, bool]] = None,
+    is_global: bool = False, explicit_provider: str = "",
     user_providers: dict = None, custom_providers: list | None = None) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1463,7 +1480,8 @@ def switch_model(
     ``custom_providers:`` list."""
     st = _Switch(
         raw_input=raw_input, current_provider=current_provider, current_model=current_model,
-        current_base_url=current_base_url, current_api_key=current_api_key, is_global=is_global,
+        current_base_url=current_base_url, current_api_key=current_api_key,
+        current_provider_capabilities=current_provider_capabilities, is_global=is_global,
         explicit_provider=explicit_provider, user_providers=user_providers, custom_providers=custom_providers,
         new_model=raw_input.strip(), target_provider=current_provider)
     route = _route_explicit_provider if explicit_provider else _route_from_model_input

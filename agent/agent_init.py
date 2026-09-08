@@ -1884,6 +1884,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.runtime_capabilities = resolve_native_compaction_capabilities(
         model=agent.model, base_url=agent.base_url, provider=agent.provider,
         is_codex_backend=(agent.provider or "").strip().lower() == "openai-codex",
+        provider_capabilities=agent.capabilities,
     )
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
@@ -2091,6 +2092,10 @@ def _snapshot_primary_runtime(agent):
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "capabilities": dict(getattr(agent, "capabilities", {}) or {}),
+        "runtime_capabilities": dict(
+            getattr(agent, "runtime_capabilities", {}) or {}
+        ),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,

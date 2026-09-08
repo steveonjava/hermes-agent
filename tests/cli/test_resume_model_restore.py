@@ -6,7 +6,9 @@ makes `hermes --resume` reopen a session on the model/provider it actually
 used instead of the ambient config default (#57588-class, #79536).
 """
 
+import copy
 import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -116,6 +118,129 @@ def test_restore_session_model_swaps_running_agent_in_place():
     stub = _make_stub(agent=_Agent())
     stub._restore_session_model(_row())
     assert calls["new_model"] == "glm-4.7"
+
+
+def test_resume_running_agent_preserves_trusted_proxy_capabilities(monkeypatch):
+    calls = {}
+
+    class _Agent:
+        capabilities = {}
+        runtime_capabilities = {"native_compaction": False}
+
+        def switch_model(self, **kwargs):
+            calls.update(kwargs)
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "custom",
+            "requested_provider": "custom:trusted-proxy",
+            "api_key": "test-key",
+            "base_url": "https://trusted-proxy.example/v1",
+            "api_mode": "codex_responses",
+            "capabilities": {"openai_native_compaction": True},
+        },
+    )
+    stub = _make_stub(agent=_Agent())
+
+    stub._restore_session_model(
+        _row(
+            model="gpt-5.6-sol-chatgpt-tier",
+            model_config={
+                "gateway_runtime": {
+                    "provider": "custom:trusted-proxy",
+                    "base_url": "https://trusted-proxy.example/v1",
+                    "api_mode": "codex_responses",
+                }
+            },
+        )
+    )
+
+    assert calls["provider_capabilities"] == {
+        "openai_native_compaction": True
+    }
+    assert calls["runtime_capabilities"] == {"native_compaction": True}
+
+
+def test_startup_resume_rehydrates_trusted_proxy_capabilities(tmp_path, monkeypatch):
+    """The real --resume startup path must rebuild both capability maps."""
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = copy.deepcopy(cli_mod.CLI_CONFIG)
+    config["model"] = {
+        "default": "ambient-model",
+        "provider": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    config["custom_providers"] = [
+        {
+            "name": "trusted-proxy",
+            "base_url": "https://trusted-proxy.example/v1",
+            "api_key": "test-key",
+            "api_mode": "codex_responses",
+            "model": "gpt-5.6-sol-chatgpt-tier",
+            "capabilities": {"openai_native_compaction": True},
+        }
+    ]
+    monkeypatch.setattr(cli_mod, "CLI_CONFIG", config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+    monkeypatch.setattr(cli_mod, "get_tool_definitions", lambda *a, **k: [])
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(
+        session_id="startup-resume",
+        source="cli",
+        model="gpt-5.6-sol-chatgpt-tier",
+    )
+    db.patch_session_model_config(
+        "startup-resume",
+        {
+            "gateway_runtime": {
+                "provider": "custom:trusted-proxy",
+                "base_url": "https://trusted-proxy.example/v1",
+                "api_mode": "codex_responses",
+            }
+        },
+    )
+    db.append_message("startup-resume", "user", "resume me")
+
+    shell = cli_mod.HermesCLI(resume="startup-resume", compact=True, max_turns=1)
+    shell._session_db = db
+    shell._console_print = lambda *a, **k: None
+
+    assert shell._preload_resumed_session() is True
+    assert shell.provider == "custom:trusted-proxy"
+    assert shell.requested_provider == "custom:trusted-proxy"
+
+    monkeypatch.setattr(shell, "_install_tool_callbacks", lambda: None)
+    monkeypatch.setattr(shell, "_ensure_tirith_security", lambda: None)
+    monkeypatch.setattr(shell, "finalize_preloaded_skills", lambda: None)
+    monkeypatch.setattr(cli_mod, "_prepare_deferred_agent_startup", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+        lambda **kwargs: None,
+    )
+
+    assert shell._ensure_runtime_credentials() is True
+    turn_route = shell._resolve_turn_agent_config("continue")
+    assert turn_route["runtime"]["capabilities"] == {
+        "openai_native_compaction": True
+    }
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI", return_value=MagicMock()),
+    ):
+        assert shell._init_agent(
+            model_override=turn_route["model"],
+            runtime_override=turn_route["runtime"],
+        ) is True
+
+    assert shell.agent.capabilities == {"openai_native_compaction": True}
+    assert shell.agent.runtime_capabilities == {"native_compaction": True}
 
 
 # ── _persist_model_switch_to_session ────────────────────────────────

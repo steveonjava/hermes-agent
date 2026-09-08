@@ -39,6 +39,7 @@ def _current_runtime(cli) -> dict:
         "provider": cli.provider,
         "requested_provider": getattr(cli, "requested_provider", cli.provider),
         "api_mode": cli.api_mode,
+        "capabilities": dict(getattr(cli, "capabilities", {}) or {}),
         "command": cli.acp_command,
         "args": list(cli.acp_args or []),
         "credential_pool": getattr(cli, "_credential_pool", None)}
@@ -48,7 +49,8 @@ def _route_signature(model, runtime: dict) -> tuple:
     """Hashable identity of (model, routing) used to detect when the agent must be rebuilt."""
     return (
         model, runtime.get("provider"), runtime.get("requested_provider"), runtime.get("base_url"),
-        runtime.get("api_mode"), runtime.get("command"), tuple(runtime.get("args") or ()))
+        runtime.get("api_mode"), tuple(sorted((runtime.get("capabilities") or {}).items())),
+        runtime.get("command"), tuple(runtime.get("args") or ()))
 
 
 def _keyless_custom_base(base_url) -> bool:
@@ -229,6 +231,12 @@ class CLIAgentSetupMixin:
         self.provider, self.api_mode, self.acp_command, self.acp_args = resolved_routing
         self._credential_pool = runtime.get("credential_pool")
         self._provider_source = runtime.get("source")
+        raw_capabilities = runtime.get("capabilities")
+        self.capabilities = (
+            {key: value for key, value in raw_capabilities.items()
+             if isinstance(key, str) and isinstance(value, bool)}
+            if isinstance(raw_capabilities, dict) else {}
+        )
         self.api_key = api_key
         self.base_url = base_url
 
@@ -518,6 +526,7 @@ class CLIAgentSetupMixin:
                 requested_provider=runtime.get("requested_provider"),
                 api_mode=runtime.get("api_mode"), acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"), credential_pool=runtime.get("credential_pool"),
+                capabilities=runtime.get("capabilities"),
                 max_iterations=self.max_turns,
                 run_budget_seconds=getattr(self, "run_budget_seconds", None),
                 enabled_toolsets=self.enabled_toolsets, disabled_toolsets=self.disabled_toolsets,
