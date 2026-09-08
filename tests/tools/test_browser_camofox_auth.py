@@ -34,6 +34,24 @@ def _mock_response(status=200, json_data=None):
 class TestAuthHeaders:
     """Unit tests for _auth_headers() helper."""
 
+    def test_access_key_takes_precedence(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_ACCESS_KEY", "access-key")
+        monkeypatch.setenv("CAMOFOX_API_KEY", "api-key")
+
+        assert _auth_headers() == {"Authorization": "Bearer access-key"}
+
+    def test_api_key_remains_a_fallback(self, monkeypatch):
+        monkeypatch.delenv("CAMOFOX_ACCESS_KEY", raising=False)
+        monkeypatch.setenv("CAMOFOX_API_KEY", "api-key")
+
+        assert _auth_headers() == {"Authorization": "Bearer api-key"}
+
+    def test_blank_access_key_uses_api_key_fallback(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_ACCESS_KEY", "  ")
+        monkeypatch.setenv("CAMOFOX_API_KEY", "api-key")
+
+        assert _auth_headers() == {"Authorization": "Bearer api-key"}
+
     def test_empty_when_no_key(self, monkeypatch):
         monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
         assert _auth_headers() == {}
