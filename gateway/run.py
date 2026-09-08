@@ -1557,6 +1557,16 @@ def _planned_restart_notification_pending() -> bool:
     return _planned_restart_notification_path().exists()
 
 
+def _planned_restart_notification_message() -> Optional[str]:
+    """Return an optional home-channel message carried by the planned-restart marker."""
+    try:
+        payload = json.loads(_planned_restart_notification_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    message = payload.get("message") if isinstance(payload, dict) else None
+    return message if isinstance(message, str) and message else None
+
+
 def _clear_planned_restart_notification() -> None:
     _planned_restart_notification_path().unlink(missing_ok=True)
 

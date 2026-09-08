@@ -204,14 +204,24 @@ class GatewayStartupMixin:
         ``_send_restart_notification`` and ``_redeliver_pending_obligations`` used to be awaited inline
         *before* ``_finish_startup_restore`` released the gate. See #91969.
         """
-        from gateway.run import _clear_planned_restart_notification, _startup_restore_drain_timeout_secs
+        from gateway.run import (
+            _clear_planned_restart_notification,
+            _planned_restart_notification_message,
+            _startup_restore_drain_timeout_secs,
+        )
         claimed = await self._claim_pending_obligations()
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
             if planned_restart_notification_pending:
                 try:
-                    await self._send_home_channel_startup_notifications(skip_targets=None)
+                    await self._send_home_channel_startup_notifications(
+                        skip_targets=None,
+                        message=(
+                            _planned_restart_notification_message()
+                            or "♻️ Gateway online — Hermes is back and ready."
+                        ),
+                    )
                 finally:
                     _clear_planned_restart_notification()
             await self._redeliver_claimed_obligations(claimed)

@@ -33,6 +33,38 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     assert gateway_run._planned_restart_notification_pending() is False
 
 
+def test_planned_restart_notification_uses_marker_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    marker = tmp_path / ".restart_pending.json"
+    marker.write_text(json.dumps({"message": "Restart complete; awaiting operator continuation."}))
+
+    assert gateway_run._planned_restart_notification_message() == (
+        "Restart complete; awaiting operator continuation."
+    )
+
+
+@pytest.mark.asyncio
+async def test_planned_restart_sends_marker_message_and_clears_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    marker = tmp_path / ".restart_pending.json"
+    message = "Restart complete; awaiting operator continuation."
+    marker.write_text(json.dumps({"message": message}))
+
+    runner, _adapter = make_restart_runner()
+    runner._claim_pending_obligations = AsyncMock(return_value=[])
+    runner._send_restart_notification = AsyncMock()
+    runner._send_home_channel_startup_notifications = AsyncMock(return_value=set())
+    runner._redeliver_claimed_obligations = AsyncMock(return_value=0)
+
+    await runner._await_startup_boot_sends(planned_restart_notification_pending=True)
+
+    runner._send_home_channel_startup_notifications.assert_awaited_once_with(
+        skip_targets=None,
+        message=message,
+    )
+    assert not marker.exists()
+
+
 # ── _handle_restart_command writes .restart_notify.json ──────────────────
 
 

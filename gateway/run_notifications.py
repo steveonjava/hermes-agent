@@ -709,7 +709,10 @@ class GatewayNotificationsMixin:
             return False
 
     async def _send_home_channel_startup_notifications(
-        self, *, skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None
+        self,
+        *,
+        skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+        message: str = "♻️ Gateway online — Hermes is back and ready.",
     ) -> set[tuple[str, str, Optional[str]]]:
         """Notify configured home channels that the gateway is back online.
 
@@ -718,7 +721,6 @@ class GatewayNotificationsMixin:
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
         for platform, platform_cfg, home, transport in self._home_channel_transports():
             if not platform_cfg.gateway_restart_notification:
                 logger.info(
