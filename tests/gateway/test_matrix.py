@@ -3342,3 +3342,91 @@ class TestCryptoPickleKeyMigration:
         # start still sees a legacy-key account and retries the migration.
         store.put_account.assert_not_awaited()
         assert "retried on the next start" in caplog.text
+
+class TestMatrixPermanentAuthClassifier:
+    """Only genuine 401/403 auth failures may stop the sync loop.
+
+    A transient homeserver outage surfaces as a 5xx whose body may be an HTML
+    error page. The Umbrel app-proxy returns one whose embedded SVG contains the
+    coordinate ``40.4302``, which contains the substring ``403``. The old
+    ``"403" in str(exc)`` check false-positived on that and permanently halted
+    Matrix sync on a passing blip. The classifier must retry any status that is
+    not 401/403.
+    """
+
+    # Trimmed excerpt of the actual Umbrel 502 body that caused the outage;
+    # the SVG path coordinate 40.4302 contains the substring "403".
+    _REAL_502 = (
+        '502: <!DOCTYPE html><svg><path d="M17.4517 40.4302C12.7214 40.4302'
+        ' 9.82339 41.8182 7.98048 44.0001"/></svg>'
+    )
+
+    def _fn(self):
+        from plugins.platforms.matrix.adapter import _is_permanent_matrix_auth_error
+
+        return _is_permanent_matrix_auth_error
+
+    def test_transient_502_html_body_is_retried(self):
+        # The exact failure mode: a 502 whose HTML body embeds "403".
+        assert self._fn()(Exception(self._REAL_502)) is False
+
+    @pytest.mark.parametrize("status", [500, 502, 503, 504, 429])
+    def test_server_errors_are_retried(self, status):
+        assert self._fn()(Exception(f"{status}: upstream unavailable")) is False
+
+    def test_connection_errors_are_retried(self):
+        fn = self._fn()
+        assert fn(Exception("[Errno 104] Connection reset by peer")) is False
+        assert fn(Exception("Server disconnected")) is False
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_real_auth_status_stops_sync(self, status):
+        assert self._fn()(Exception(f"{status}: nope")) is True
+
+    def test_http_status_attribute_beats_body_digits(self):
+        # A structured 502 whose message text also contains "403" must retry.
+        exc = Exception("body 40.4302")
+        exc.http_status = 502
+        assert self._fn()(exc) is False
+
+    def test_errcode_unknown_token_stops_sync(self):
+        exc = Exception("sync failed")
+        exc.errcode = "M_UNKNOWN_TOKEN"
+        assert self._fn()(exc) is True
+
+    def test_bare_auth_keyword_without_status_stops_sync(self):
+        assert self._fn()(Exception("Unauthorized")) is True
+
+    def test_misleading_code_attribute_is_not_misclassified(self):
+        # A non-Matrix exception with a bare `.code` that happens to be 401
+        # must NOT be treated as an auth failure. `.code` on an arbitrary
+        # exception can be an errno or an exit code; only `.http_status`
+        # is trustworthy for HTTP status classification.
+        exc = Exception("subprocess failed")
+        exc.code = 401
+        assert self._fn()(exc) is False
+
+    def test_status_attribute_is_ignored_in_favor_of_http_status(self):
+        # aiohttp response objects and similar carry `.status`, which is a
+        # different namespace than mautrix's `.http_status`. A bare `.status`
+        # must not drive the classification.
+        exc = Exception("some http client error")
+        exc.status = 403
+        assert self._fn()(exc) is False
+
+    @pytest.mark.parametrize(
+        "exc_factory",
+        [
+            lambda: asyncio.TimeoutError("401 in the pagination token url"),
+            lambda: TimeoutError("403 in the pagination token url"),
+            lambda: ConnectionError("... forbidden ..."),
+            lambda: ConnectionResetError("Connection reset, status 401"),
+            lambda: OSError("network unreachable, code 403"),
+        ],
+    )
+    def test_transient_exception_types_never_classify_as_permanent(self, exc_factory):
+        # Transport-level exception types are short-circuited to "transient"
+        # before any text/status inspection runs, so a coincidental "401"
+        # or the keyword "forbidden" inside their message can never flip
+        # them to permanent.
+        assert self._fn()(exc_factory()) is False
