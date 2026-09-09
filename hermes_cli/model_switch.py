@@ -1052,6 +1052,7 @@ class _Switch:
     base_url: str = ""
     api_mode: str = ""
     validation_headers: dict = field(default_factory=dict)
+    provider_capabilities: dict[str, bool] = field(default_factory=dict)
     suppress_ollama_headers: bool = False
     validation: dict = field(default_factory=dict)
 
@@ -1074,6 +1075,12 @@ class _Switch:
         self.api_key, self.base_url = rt.get("api_key", ""), rt.get("base_url", "")
         self.api_mode = rt.get("api_mode", "")
         self.validation_headers = rt.get("extra_headers") or self.validation_headers
+        capabilities = rt.get("capabilities")
+        self.provider_capabilities = (
+            {key: value for key, value in capabilities.items()
+             if isinstance(key, str) and isinstance(value, bool)}
+            if isinstance(capabilities, dict) else {}
+        )
 
 
 def _route_explicit_provider(st: _Switch) -> Optional[ModelSwitchResult]:
@@ -1427,22 +1434,10 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
 
     capabilities = get_model_capabilities(st.target_provider, st.new_model, allow_network=True)
     from agent.native_compaction import resolve_native_compaction_capabilities
-    provider_capabilities = {}
-    if (st.target_provider or "").strip().lower() == (st.current_provider or "").strip().lower():
-        provider_capabilities = dict(st.current_provider_capabilities or {})
-    if not provider_capabilities:
-        for entry in st.custom_providers or []:
-            if not isinstance(entry, dict) or str(entry.get("base_url") or "").rstrip("/") != st.base_url.rstrip("/"):
-                continue
-            raw = entry.get("capabilities")
-            if isinstance(raw, dict):
-                provider_capabilities = {key: value for key, value in raw.items()
-                                         if isinstance(key, str) and isinstance(value, bool)}
-            break
     runtime_capabilities = resolve_native_compaction_capabilities(
         model=st.new_model, base_url=st.base_url, provider=st.target_provider,
         is_codex_backend=st.target_provider.strip().lower() == "openai-codex",
-        provider_capabilities=provider_capabilities)
+        provider_capabilities=st.provider_capabilities)
     model_info = get_model_info(st.target_provider, st.new_model, allow_network=True)
 
     warnings = [w for w in (st.validation.get("message"), _check_hermes_model_warning(st.new_model)) if w]
@@ -1461,7 +1456,7 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
         provider_changed=st.provider_changed, api_key=st.api_key, base_url=st.base_url, api_mode=st.api_mode,
         request_overrides=dict(request_overrides or {}), warning_message=" | ".join(warnings) if warnings else "",
         provider_label=st.provider_label, resolved_via_alias=st.resolved_alias, capabilities=capabilities,
-        provider_capabilities=provider_capabilities,
+        provider_capabilities=st.provider_capabilities,
         runtime_capabilities={
             k: v for k, v in runtime_capabilities.items() if isinstance(k, str) and isinstance(v, bool)},
         model_info=model_info, is_global=st.is_global)
