@@ -1081,6 +1081,14 @@ class _Switch:
              if isinstance(key, str) and isinstance(value, bool)}
             if isinstance(capabilities, dict) else {}
         )
+        if not self.provider_capabilities and (
+            (self.target_provider or "").strip().lower()
+            == (self.current_provider or "").strip().lower()
+        ):
+            self.provider_capabilities = {
+                key: value for key, value in (self.current_provider_capabilities or {}).items()
+                if isinstance(key, str) and isinstance(value, bool)
+            }
 
 
 def _route_explicit_provider(st: _Switch) -> Optional[ModelSwitchResult]:
@@ -1279,6 +1287,10 @@ def _creds_for_switched_provider(st: _Switch) -> Optional[ModelSwitchResult]:
     elif st.target_provider == "custom" and st.current_base_url:
         st.api_key, st.base_url = st.current_api_key, st.current_base_url
         st.api_mode = determine_api_mode(st.target_provider, st.base_url)
+        st.provider_capabilities = {
+            key: value for key, value in (st.current_provider_capabilities or {}).items()
+            if isinstance(key, str) and isinstance(value, bool)
+        }
     else:
         try:
             st.resolve_runtime(requested=st.target_provider)
