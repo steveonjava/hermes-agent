@@ -430,6 +430,33 @@ class TestMatrixSelfProfileSync:
         client.set_avatar_url.assert_not_awaited()
         assert "global self-profile avatar sync failed" in caplog.text
 
+    @pytest.mark.asyncio
+    async def test_profile_sync_redacts_configured_values_from_field_errors(self, caplog):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        display_name = "Hermes Private Display"
+        avatar_url = "mxc://matrix.example.org/private-avatar"
+        adapter = MatrixAdapter(PlatformConfig(extra={"self_profile": {
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+        }}))
+        client = MagicMock()
+        client.get_displayname = AsyncMock(side_effect=RuntimeError(display_name))
+        client.set_displayname = AsyncMock()
+        client.get_avatar_url = AsyncMock(return_value="mxc://matrix.example.org/old-avatar")
+        client.set_avatar_url = AsyncMock(side_effect=RuntimeError(avatar_url))
+        adapter._client = client
+        adapter._user_id = "@hermes:matrix.example.org"
+
+        await adapter._sync_self_profile()
+
+        client.set_displayname.assert_not_awaited()
+        client.set_avatar_url.assert_awaited_once_with(avatar_url, check_current=False)
+        assert "global self-profile display-name sync failed" in caplog.text
+        assert "global self-profile avatar sync failed" in caplog.text
+        assert display_name not in caplog.text
+        assert avatar_url not in caplog.text
+
     @pytest.mark.parametrize(("self_profile", "expected"), [
         (None, None),
         ({}, None),

@@ -1182,15 +1182,15 @@ class MatrixAdapter(BasePlatformAdapter):
                 current_name = await client.get_displayname(user_id)
                 if current_name != configured["display_name"]:
                     await client.set_displayname(configured["display_name"], check_current=False)
-            except Exception as exc:
-                logger.warning("Matrix: global self-profile display-name sync failed: %s", exc)
+            except Exception:
+                logger.warning("Matrix: global self-profile display-name sync failed (error redacted)")
         if "avatar_url" in configured:
             try:
                 current_avatar = await client.get_avatar_url(user_id)
                 if str(current_avatar or "") != configured["avatar_url"]:
                     await client.set_avatar_url(configured["avatar_url"], check_current=False)
-            except Exception as exc:
-                logger.warning("Matrix: global self-profile avatar sync failed: %s", exc)
+            except Exception:
+                logger.warning("Matrix: global self-profile avatar sync failed (error redacted)")
 
     async def _connect_setup_e2ee(self, client: Any, api: Any, state_store: Any) -> bool:
         """Set up the Olm machine + crypto store. Returns False when connect must abort."""
