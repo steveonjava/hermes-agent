@@ -439,6 +439,7 @@ def _resolve_max_message_length(config) -> int:
 from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STARTUP_GRACE_SECONDS = 5  # ignore messages older than this many seconds before startup
+_SELF_PROFILE_SYNC_TIMEOUT_SECONDS = 5
 
 _OUTBOUND_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
 
@@ -496,11 +497,23 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
     if isinstance(display_name, str) and display_name.strip():
         resolved["display_name"] = display_name.strip()
     avatar_url = configured.get("avatar_url")
-    if isinstance(avatar_url, str) and avatar_url.startswith("mxc://"):
-        server_and_media_id = avatar_url[6:].split("/")
-        if len(server_and_media_id) == 2 and all(
-            part and not any(char.isspace() or char in "?#" for char in part)
-            for part in server_and_media_id
+    if isinstance(avatar_url, str):
+        try:
+            parsed = urlsplit(avatar_url)
+            parsed.port  # Validate a numeric, in-range port when present.
+        except ValueError:
+            parsed = None
+        if (
+            parsed is not None
+            and parsed.scheme == "mxc"
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path.count("/") == 1
+            and len(parsed.path) > 1
+            and not parsed.query
+            and not parsed.fragment
+            and not any(char.isspace() for char in avatar_url)
         ):
             resolved["avatar_url"] = avatar_url
     return resolved or None
@@ -1342,16 +1355,24 @@ class MatrixAdapter(BasePlatformAdapter):
             return
         user_id = UserID(self._user_id)
         if "display_name" in configured:
-            try:
+            async def sync_display_name() -> None:
                 if await client.get_displayname(user_id) != configured["display_name"]:
                     await client.set_displayname(configured["display_name"], check_current=False)
+
+            try:
+                await asyncio.wait_for(
+                    sync_display_name(), timeout=_SELF_PROFILE_SYNC_TIMEOUT_SECONDS)
             except Exception:
                 logger.warning("Matrix: global self-profile display-name sync failed")
         if "avatar_url" in configured:
-            try:
+            async def sync_avatar_url() -> None:
                 current_avatar = await client.get_avatar_url(user_id)
                 if str(current_avatar or "") != configured["avatar_url"]:
                     await client.set_avatar_url(configured["avatar_url"], check_current=False)
+
+            try:
+                await asyncio.wait_for(
+                    sync_avatar_url(), timeout=_SELF_PROFILE_SYNC_TIMEOUT_SECONDS)
             except Exception:
                 logger.warning("Matrix: global self-profile avatar sync failed")
 
@@ -1380,9 +1401,9 @@ class MatrixAdapter(BasePlatformAdapter):
         self._client = client
         if not await self._connect_authenticate(client, api):
             return False
-        await self._sync_self_profile()
         if self._encryption and not await self._connect_setup_e2ee(client, api, state_store):
             return False
+        await self._sync_self_profile()
         if self._encryption and getattr(client, "crypto", None) is not None:
             try:
                 from .verification import SasVerificationHandler

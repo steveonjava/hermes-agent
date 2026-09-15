@@ -339,6 +339,12 @@ class TestMatrixSelfProfileSync:
             "display_name": "Hermes Homelab",
             "avatar_url": "mxc://matrix.example.org/avatar?size=large",
         }}) == {"display_name": "Hermes Homelab"}
+        assert _resolve_matrix_self_profile_sync({"self_profile": {
+            "avatar_url": "mxc://user@matrix.example.org/avatar",
+        }}) is None
+        assert _resolve_matrix_self_profile_sync({"self_profile": {
+            "avatar_url": "mxc://matrix.example.org:not-a-port/avatar",
+        }}) is None
 
     @pytest.mark.asyncio
     async def test_sync_updates_only_changed_global_profile_values(self):
@@ -408,6 +414,68 @@ class TestMatrixSelfProfileSync:
 
         assert display_name not in caplog.text
         assert avatar_url not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_sync_timeout_does_not_block_other_field(self, monkeypatch):
+        import plugins.platforms.matrix.adapter as matrix_mod
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(PlatformConfig(extra={"self_profile": {
+            "display_name": "Hermes Homelab",
+            "avatar_url": "mxc://matrix.example.org/hermes-avatar",
+        }}))
+        never_returns = asyncio.Event()
+
+        async def wait_forever(*_args):
+            await never_returns.wait()
+
+        client = MagicMock()
+        client.get_displayname = AsyncMock(side_effect=wait_forever)
+        client.set_displayname = AsyncMock()
+        client.get_avatar_url = AsyncMock(return_value="mxc://matrix.example.org/hermes-avatar")
+        client.set_avatar_url = AsyncMock()
+        adapter._client = client
+        adapter._user_id = "@hermes:matrix.example.org"
+        monkeypatch.setattr(matrix_mod, "_SELF_PROFILE_SYNC_TIMEOUT_SECONDS", 0.01, raising=False)
+
+        await asyncio.wait_for(adapter._sync_self_profile(), timeout=0.2)
+
+        client.set_displayname.assert_not_awaited()
+        client.get_avatar_url.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_connect_does_not_sync_profile_when_required_e2ee_setup_fails(self):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(PlatformConfig(
+            enabled=True,
+            token="syt_test_access_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "self_profile": {"display_name": "Hermes Homelab"},
+            },
+        ))
+        adapter._encryption = True
+        fake_mautrix_mods = _make_fake_mautrix()
+        client = MagicMock()
+        client.mxid = "@hermes:matrix.example.org"
+        client.device_id = None
+        client.whoami = AsyncMock(return_value=MagicMock(
+            user_id="@hermes:matrix.example.org", device_id="DEV123"
+        ))
+        client.api = MagicMock()
+        client.api.session.close = AsyncMock()
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=client)
+
+        with (
+            patch.dict("sys.modules", fake_mautrix_mods),
+            patch.object(adapter, "_connect_setup_e2ee", AsyncMock(return_value=False)),
+            patch.object(adapter, "_sync_self_profile", AsyncMock()) as sync_self_profile,
+            patch("plugins.platforms.matrix.adapter._create_matrix_session", return_value=MagicMock()),
+        ):
+            assert await adapter.connect() is False
+
+        sync_self_profile.assert_not_awaited()
 
     def test_yaml_loader_passes_self_profile_without_environment_variables(self, tmp_path, monkeypatch):
         from gateway.config import load_gateway_config
