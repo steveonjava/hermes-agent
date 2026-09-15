@@ -25,6 +25,6 @@
 
 - Run the complete Matrix gateway test file; run Ruff lint, formatter assessment, type checks, docs checks, diff checks, and secret scans. Record environmental or pre-existing-check blockers precisely.
 - Commit the reconciled source, tests, documentation, non-blocking background profile sync, and strict MXC server validation on one new immutable fork branch; push without force and do not merge `main`.
-- Attach this exact plan as a native Matrix `m.file`, download it from Matrix, and compare its SHA-256 to the local artifact.
+- Attach this exact revised plan as a native Matrix `m.file`, download it from Matrix, and compare its SHA-256 to the local artifact.
 - Post a task- and hostname-specific source-only status update to `!xwKWZbbmZarPHKDEeU:matrix.browsecode.org`.
 - Request two fresh independent reviews against the exact pushed commit. Stop before any integration, deployment, gateway restart, profile mutation, room operation, canary, private-KB lifecycle change, or CT303 runtime change.
