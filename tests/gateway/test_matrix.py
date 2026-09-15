@@ -368,7 +368,7 @@ class TestMatrixSelfProfileSync:
         }}) is None
         assert _resolve_matrix_self_profile_sync({"self_profile": {
             "avatar_url": "mxc://matrix.example.org/media.id",
-        }}) is None
+        }}) == {"avatar_url": "mxc://matrix.example.org/media.id"}
         assert _resolve_matrix_self_profile_sync({"self_profile": {
             "avatar_url": f"mxc://matrix.example.org:{'9' * 5000}/avatar",
         }}) is None

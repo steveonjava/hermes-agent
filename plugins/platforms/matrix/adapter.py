@@ -528,7 +528,9 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
                 valid_server = valid_host and (not separator or (
                     port.isascii() and port.isdigit() and len(port) <= 5 and 0 < int(port) <= 65535
                 ))
-            if valid_server and bool(re.fullmatch(r"[A-Za-z0-9_-]+", media_id)):
+            if valid_server and media_id and not any(
+                char.isspace() or char in "?#/" for char in media_id
+            ):
                 resolved["avatar_url"] = avatar_url
     return resolved or None
 
