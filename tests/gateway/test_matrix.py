@@ -321,6 +321,98 @@ def _make_adapter():
 
 
 # ---------------------------------------------------------------------------
+# Global self-profile synchronization
+# ---------------------------------------------------------------------------
+
+class TestMatrixSelfProfileSync:
+    def test_self_profile_requires_valid_independent_fields(self):
+        from plugins.platforms.matrix.adapter import _resolve_matrix_self_profile_sync
+
+        assert _resolve_matrix_self_profile_sync({"self_profile": {
+            "display_name": " Hermes Homelab ",
+            "avatar_url": "mxc://matrix.example.org/hermes-avatar",
+        }}) == {
+            "display_name": "Hermes Homelab",
+            "avatar_url": "mxc://matrix.example.org/hermes-avatar",
+        }
+        assert _resolve_matrix_self_profile_sync({"self_profile": {
+            "display_name": "Hermes Homelab",
+            "avatar_url": "mxc://matrix.example.org/avatar?size=large",
+        }}) == {"display_name": "Hermes Homelab"}
+
+    @pytest.mark.asyncio
+    async def test_sync_updates_only_changed_global_profile_values(self):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(PlatformConfig(extra={"self_profile": {
+            "display_name": "Hermes Homelab",
+            "avatar_url": "mxc://matrix.example.org/hermes-avatar",
+        }}))
+        client = MagicMock()
+        client.get_displayname = AsyncMock(return_value="Old Hermes")
+        client.get_avatar_url = AsyncMock(return_value="mxc://matrix.example.org/old-avatar")
+        client.set_displayname = AsyncMock()
+        client.set_avatar_url = AsyncMock()
+        adapter._client = client
+        adapter._user_id = "@hermes:matrix.example.org"
+
+        await adapter._sync_self_profile()
+
+        client.get_displayname.assert_awaited_once_with("@hermes:matrix.example.org")
+        client.get_avatar_url.assert_awaited_once_with("@hermes:matrix.example.org")
+        client.set_displayname.assert_awaited_once_with("Hermes Homelab", check_current=False)
+        client.set_avatar_url.assert_awaited_once_with(
+            "mxc://matrix.example.org/hermes-avatar", check_current=False
+        )
+        assert [call for call in client.mock_calls if "room" in call[0]] == []
+
+    @pytest.mark.asyncio
+    async def test_sync_field_failure_does_not_block_other_field(self, caplog):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(PlatformConfig(extra={"self_profile": {
+            "display_name": "Hermes Homelab",
+            "avatar_url": "mxc://matrix.example.org/hermes-avatar",
+        }}))
+        client = MagicMock()
+        client.get_displayname = AsyncMock(return_value="Old Hermes")
+        client.set_displayname = AsyncMock()
+        client.get_avatar_url = AsyncMock(side_effect=RuntimeError("profile read failed"))
+        client.set_avatar_url = AsyncMock()
+        adapter._client = client
+        adapter._user_id = "@hermes:matrix.example.org"
+
+        await adapter._sync_self_profile()
+
+        client.set_displayname.assert_awaited_once_with("Hermes Homelab", check_current=False)
+        client.set_avatar_url.assert_not_awaited()
+        assert "global self-profile avatar sync failed" in caplog.text
+
+    def test_yaml_loader_passes_self_profile_without_environment_variables(self, tmp_path, monkeypatch):
+        from gateway.config import load_gateway_config
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "matrix:\n"
+            "  enabled: true\n"
+            "  token: syt_test_access_token\n"
+            "  homeserver: https://matrix.example.org\n"
+            "  self_profile:\n"
+            "    display_name: Hermes Homelab\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("MATRIX_HOMESERVER", raising=False)
+        monkeypatch.delenv("MATRIX_ACCESS_TOKEN", raising=False)
+
+        config = load_gateway_config().platforms[Platform.MATRIX]
+
+        assert MatrixAdapter(config)._self_profile_sync == {"display_name": "Hermes Homelab"}
+
+
+# ---------------------------------------------------------------------------
 # Typing indicator
 # ---------------------------------------------------------------------------
 

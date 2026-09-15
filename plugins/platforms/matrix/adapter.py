@@ -486,6 +486,26 @@ def _is_bare_media_filename(msgtype: str, body: str) -> bool:
     return msgtype in ("m.audio", "m.file", "m.video") and _looks_like_matrix_media_filename(body)
 
 
+def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] | None:
+    """Return valid, explicitly configured global profile fields without env fallback."""
+    configured = extra.get("self_profile")
+    if not isinstance(configured, dict):
+        return None
+    resolved: dict[str, str] = {}
+    display_name = configured.get("display_name")
+    if isinstance(display_name, str) and display_name.strip():
+        resolved["display_name"] = display_name.strip()
+    avatar_url = configured.get("avatar_url")
+    if isinstance(avatar_url, str) and avatar_url.startswith("mxc://"):
+        server_and_media_id = avatar_url[6:].split("/")
+        if len(server_and_media_id) == 2 and all(
+            part and not any(char.isspace() or char in "?#" for char in part)
+            for part in server_and_media_id
+        ):
+            resolved["avatar_url"] = avatar_url
+    return resolved or None
+
+
 def _matrix_event_timestamp_seconds(event: Any) -> float:
     """Return a Matrix event timestamp in seconds, accepting ms or sec values."""
     try:
@@ -848,6 +868,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._e2ee_mode: str = _resolve_e2ee_mode(config.extra)
         self._encryption: bool = self._e2ee_mode != "off"
         self._device_id: str = config.extra.get("device_id", "") or os.getenv("MATRIX_DEVICE_ID", "")
+        self._self_profile_sync = _resolve_matrix_self_profile_sync(config.extra)
         self._device_id_unverified: bool = False
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
@@ -1313,6 +1334,27 @@ class MatrixAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Matrix: initial sync error: %s", exc)
 
+    async def _sync_self_profile(self) -> None:
+        """Reconcile explicitly configured global identity fields after authentication."""
+        configured = self._self_profile_sync
+        client = self._client
+        if not configured or not client or not self._user_id:
+            return
+        user_id = UserID(self._user_id)
+        if "display_name" in configured:
+            try:
+                if await client.get_displayname(user_id) != configured["display_name"]:
+                    await client.set_displayname(configured["display_name"], check_current=False)
+            except Exception as exc:
+                logger.warning("Matrix: global self-profile display-name sync failed: %s", exc)
+        if "avatar_url" in configured:
+            try:
+                current_avatar = await client.get_avatar_url(user_id)
+                if str(current_avatar or "") != configured["avatar_url"]:
+                    await client.set_avatar_url(configured["avatar_url"], check_current=False)
+            except Exception as exc:
+                logger.warning("Matrix: global self-profile avatar sync failed: %s", exc)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._device_id_unverified = False
         if self._client is not None:
@@ -1338,6 +1380,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._client = client
         if not await self._connect_authenticate(client, api):
             return False
+        await self._sync_self_profile()
         if self._encryption and not await self._connect_setup_e2ee(client, api, state_store):
             return False
         if self._encryption and getattr(client, "crypto", None) is not None:
@@ -3159,6 +3202,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
             os.environ[env_name] = str(value)
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
         os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
+    if "self_profile" in matrix_cfg:
+        return {"self_profile": matrix_cfg["self_profile"]}
     return None
 
 

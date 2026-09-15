@@ -100,6 +100,30 @@ matrix:
   max_message_length: 16000       # Outbound chunk size in chars (default: 16000, max: 65535)
 ```
 
+### Global Self-Profile Synchronization
+
+Hermes does not change its Matrix account profile by default. To opt in, configure
+`matrix.self_profile` in `config.yaml`:
+
+```yaml
+matrix:
+  self_profile:
+    display_name: "Hermes Homelab"
+    avatar_url: "mxc://matrix.example.org/hermes-avatar"
+```
+
+`self_profile` must be a mapping. Its fields are independent:
+
+- `display_name` is used only when it is a non-empty string; leading and trailing whitespace is removed.
+- `avatar_url` is used only when it is an `mxc://<server>/<media-id>` URI with exactly one non-empty server component and one non-empty media-ID component. Whitespace, query (`?`), and fragment (`#`) characters are invalid in either component. Hermes preserves the configured URI exactly and treats it as opaque: it does not fetch, upload, inspect, convert, or proxy media.
+- An absent, empty, non-string, or invalid field is ignored. If neither field is valid, Hermes makes no self-profile API request or write.
+
+After authentication, Hermes reads only its own global Matrix profile. It calls the
+matching global display-name or avatar setter only when that configured field differs.
+A failure for one field is logged and does not block normal gateway connection or the
+other field. This setting never derives identity from a DM and never changes a room
+name, room state, membership, encryption, or other per-room presentation.
+
 Or via environment variables:
 
 ```bash
