@@ -349,6 +349,12 @@ class TestMatrixSelfProfileSync:
             "avatar_url": "mxc://[2001:db8::1]/avatar",
         }}) == {"avatar_url": "mxc://[2001:db8::1]/avatar"}
         assert _resolve_matrix_self_profile_sync({"self_profile": {
+            "avatar_url": "mxc://matrix.example.org:8448/avatar",
+        }}) == {"avatar_url": "mxc://matrix.example.org:8448/avatar"}
+        assert _resolve_matrix_self_profile_sync({"self_profile": {
+            "avatar_url": "mxc://[not-ipv6]/avatar",
+        }}) is None
+        assert _resolve_matrix_self_profile_sync({"self_profile": {
             "avatar_url": f"mxc://matrix.example.org:{'9' * 5000}/avatar",
         }}) is None
 

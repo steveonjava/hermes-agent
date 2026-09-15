@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import array
 import inspect
+import ipaddress
 from contextlib import suppress
 import logging
 import mimetypes
@@ -505,17 +506,21 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
                 closing_bracket = server.find("]")
                 host = server[1:closing_bracket]
                 port = server[closing_bracket + 1:]
+                try:
+                    is_ipv6 = ipaddress.ip_address(host).version == 6
+                except ValueError:
+                    is_ipv6 = False
                 has_valid_port = not port or (
                     port.startswith(":") and port[1:].isdigit() and len(port[1:]) <= 5
                     and 0 < int(port[1:]) <= 65535
                 )
-                valid_server = closing_bracket > 1 and has_valid_port
+                valid_server = closing_bracket > 1 and is_ipv6 and has_valid_port
             else:
                 host, separator, port = server.rpartition(":")
                 valid_server = (
                     bool(server)
                     and "@" not in server
-                    and not any(char.isspace() or char in "?#/:" for char in server)
+                    and not any(char.isspace() or char in "?#/" for char in server)
                     and (not separator or (
                         bool(host) and port.isdigit() and len(port) <= 5 and 0 < int(port) <= 65535
                     ))
