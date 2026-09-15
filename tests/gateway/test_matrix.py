@@ -388,6 +388,27 @@ class TestMatrixSelfProfileSync:
         client.set_avatar_url.assert_not_awaited()
         assert "global self-profile avatar sync failed" in caplog.text
 
+    @pytest.mark.asyncio
+    async def test_sync_failure_logs_redact_configured_profile_values(self, caplog):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        display_name = "Hermes Homelab Secret"
+        avatar_url = "mxc://matrix.example.org/private-avatar"
+        adapter = MatrixAdapter(PlatformConfig(extra={"self_profile": {
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+        }}))
+        client = MagicMock()
+        client.get_displayname = AsyncMock(side_effect=RuntimeError(f"failed: {display_name} {avatar_url}"))
+        client.get_avatar_url = AsyncMock(side_effect=RuntimeError(f"failed: {display_name} {avatar_url}"))
+        adapter._client = client
+        adapter._user_id = "@hermes:matrix.example.org"
+
+        await adapter._sync_self_profile()
+
+        assert display_name not in caplog.text
+        assert avatar_url not in caplog.text
+
     def test_yaml_loader_passes_self_profile_without_environment_variables(self, tmp_path, monkeypatch):
         from gateway.config import load_gateway_config
         from plugins.platforms.matrix.adapter import MatrixAdapter
