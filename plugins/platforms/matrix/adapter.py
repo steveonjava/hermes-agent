@@ -529,7 +529,8 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
                     port.isascii() and port.isdigit() and len(port) <= 5 and 0 < int(port) <= 65535
                 ))
             if valid_server and media_id and not any(
-                char.isspace() or char in "?#/" for char in media_id
+                char.isspace() or char in "?#/" or ord(char) < 32 or 127 <= ord(char) <= 159
+                for char in media_id
             ):
                 resolved["avatar_url"] = avatar_url
     return resolved or None
