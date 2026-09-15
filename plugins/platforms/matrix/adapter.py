@@ -501,13 +501,25 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
         server_and_media_id = avatar_url[6:].split("/")
         if len(server_and_media_id) == 2:
             server, media_id = server_and_media_id
-            host, separator, port = server.rpartition(":")
-            valid_server = (
-                bool(server)
-                and "@" not in server
-                and not any(char.isspace() or char in "?#/" for char in server)
-                and (not separator or (bool(host) and port.isdigit() and 0 < int(port) <= 65535))
-            )
+            if server.startswith("["):
+                closing_bracket = server.find("]")
+                host = server[1:closing_bracket]
+                port = server[closing_bracket + 1:]
+                has_valid_port = not port or (
+                    port.startswith(":") and port[1:].isdigit() and len(port[1:]) <= 5
+                    and 0 < int(port[1:]) <= 65535
+                )
+                valid_server = closing_bracket > 1 and has_valid_port
+            else:
+                host, separator, port = server.rpartition(":")
+                valid_server = (
+                    bool(server)
+                    and "@" not in server
+                    and not any(char.isspace() or char in "?#/:" for char in server)
+                    and (not separator or (
+                        bool(host) and port.isdigit() and len(port) <= 5 and 0 < int(port) <= 65535
+                    ))
+                )
             if valid_server and media_id and not any(
                 char.isspace() or char in "?#/" for char in media_id
             ):
@@ -883,6 +895,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
         self._store_dir: Optional[Path] = None  # pinned per profile in connect()
         self._sync_task: Optional[asyncio.Task] = None
+        self._self_profile_task: Optional[asyncio.Task] = None
         self._sas_verification: Any = None
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
@@ -1402,7 +1415,6 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
         if self._encryption and not await self._connect_setup_e2ee(client, api, state_store):
             return False
-        await self._sync_self_profile()
         if self._encryption and getattr(client, "crypto", None) is not None:
             try:
                 from .verification import SasVerificationHandler
@@ -1431,6 +1443,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 logger.warning("Matrix: initial key share failed: %s", exc)
         self._sync_task = asyncio.create_task(self._sync_loop())
         self._mark_connected()
+        self._self_profile_task = asyncio.create_task(self._sync_self_profile())
         self._wire_plugin_handlers(self._client)  # plugin-registered native handlers
         return True
 
@@ -1440,6 +1453,12 @@ class MatrixAdapter(BasePlatformAdapter):
             self._sync_task.cancel()
             try:
                 await self._sync_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._self_profile_task and not self._self_profile_task.done():
+            self._self_profile_task.cancel()
+            try:
+                await self._self_profile_task
             except (asyncio.CancelledError, Exception):
                 pass
         for tasks in (self._invite_join_tasks.values(), self._reaction_redaction_tasks):

@@ -345,6 +345,12 @@ class TestMatrixSelfProfileSync:
         assert _resolve_matrix_self_profile_sync({"self_profile": {
             "avatar_url": "mxc://matrix.example.org:not-a-port/avatar",
         }}) is None
+        assert _resolve_matrix_self_profile_sync({"self_profile": {
+            "avatar_url": "mxc://[2001:db8::1]/avatar",
+        }}) == {"avatar_url": "mxc://[2001:db8::1]/avatar"}
+        assert _resolve_matrix_self_profile_sync({"self_profile": {
+            "avatar_url": f"mxc://matrix.example.org:{'9' * 5000}/avatar",
+        }}) is None
 
     @pytest.mark.asyncio
     async def test_sync_updates_only_changed_global_profile_values(self):
