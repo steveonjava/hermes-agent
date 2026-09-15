@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import array
 import inspect
+import ipaddress
 from contextlib import suppress
 import logging
 import mimetypes
@@ -439,6 +440,67 @@ def _resolve_max_message_length(config) -> int:
 from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STARTUP_GRACE_SECONDS = 5  # ignore messages older than this many seconds before startup
+_SELF_PROFILE_SYNC_TIMEOUT_SECONDS = 10
+
+
+def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] | None:
+    """Return explicit valid global self-profile fields without env fallback."""
+    configured = extra.get("self_profile")
+    if not isinstance(configured, dict):
+        return None
+    resolved: dict[str, str] = {}
+    display_name = configured.get("display_name")
+    if isinstance(display_name, str) and display_name.strip():
+        resolved["display_name"] = display_name.strip()
+    avatar_url = configured.get("avatar_url")
+    if isinstance(avatar_url, str) and _is_valid_matrix_mxc_uri(avatar_url):
+        resolved["avatar_url"] = avatar_url
+    return resolved or None
+
+
+def _is_valid_matrix_mxc_uri(value: str) -> bool:
+    """Validate a single-segment MXC URI without resolving or fetching media."""
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme != "mxc" or not parsed.netloc or parsed.username or parsed.password:
+        return False
+    if parsed.query or parsed.fragment or not parsed.path.startswith("/"):
+        return False
+    media_id = parsed.path[1:]
+    if not media_id or "/" in media_id or any(char.isspace() for char in media_id):
+        return False
+    authority = parsed.netloc
+    if any(char.isspace() for char in authority) or authority.count("@"):
+        return False
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end < 2 or authority[end + 1:] not in ("", f":{port}"):
+            return False
+        try:
+            if ipaddress.ip_address(authority[1:end]).version != 6:
+                return False
+        except ValueError:
+            return False
+    elif authority.count(":") > 1:
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    if port is not None and not 0 < port <= 65535:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    labels = host.split(".")
+    return bool(
+        len(host) <= 253
+        and all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) for label in labels)
+    )
 
 _OUTBOUND_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
 
@@ -848,6 +910,8 @@ class MatrixAdapter(BasePlatformAdapter):
         self._e2ee_mode: str = _resolve_e2ee_mode(config.extra)
         self._encryption: bool = self._e2ee_mode != "off"
         self._device_id: str = config.extra.get("device_id", "") or os.getenv("MATRIX_DEVICE_ID", "")
+        self._self_profile_sync = _resolve_matrix_self_profile_sync(config.extra)
+        self._self_profile_task: Optional[asyncio.Task] = None
         self._device_id_unverified: bool = False
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
@@ -1313,6 +1377,34 @@ class MatrixAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Matrix: initial sync error: %s", exc)
 
+    async def _sync_self_profile(self) -> None:
+        """Best-effort configured global profile reconciliation after connection is live."""
+        configured = getattr(self, "_self_profile_sync", None)
+        client = getattr(self, "_client", None)
+        if not configured or not client or not self._user_id:
+            return
+        user_id = UserID(self._user_id)
+        if "display_name" in configured:
+            try:
+                current_name = await asyncio.wait_for(
+                    client.get_displayname(user_id), timeout=_SELF_PROFILE_SYNC_TIMEOUT_SECONDS)
+                if current_name != configured["display_name"]:
+                    await asyncio.wait_for(
+                        client.set_displayname(configured["display_name"], check_current=False),
+                        timeout=_SELF_PROFILE_SYNC_TIMEOUT_SECONDS)
+            except Exception:
+                logger.warning("Matrix: global self-profile display-name sync failed")
+        if "avatar_url" in configured:
+            try:
+                current_avatar = await asyncio.wait_for(
+                    client.get_avatar_url(user_id), timeout=_SELF_PROFILE_SYNC_TIMEOUT_SECONDS)
+                if str(current_avatar or "") != configured["avatar_url"]:
+                    await asyncio.wait_for(
+                        client.set_avatar_url(configured["avatar_url"], check_current=False),
+                        timeout=_SELF_PROFILE_SYNC_TIMEOUT_SECONDS)
+            except Exception:
+                logger.warning("Matrix: global self-profile avatar sync failed")
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._device_id_unverified = False
         if self._client is not None:
@@ -1368,6 +1460,8 @@ class MatrixAdapter(BasePlatformAdapter):
                 logger.warning("Matrix: initial key share failed: %s", exc)
         self._sync_task = asyncio.create_task(self._sync_loop())
         self._mark_connected()
+        if self._self_profile_sync:
+            self._self_profile_task = asyncio.create_task(self._sync_self_profile())
         self._wire_plugin_handlers(self._client)  # plugin-registered native handlers
         return True
 
@@ -1377,6 +1471,12 @@ class MatrixAdapter(BasePlatformAdapter):
             self._sync_task.cancel()
             try:
                 await self._sync_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._self_profile_task and not self._self_profile_task.done():
+            self._self_profile_task.cancel()
+            try:
+                await self._self_profile_task
             except (asyncio.CancelledError, Exception):
                 pass
         for tasks in (self._invite_join_tasks.values(), self._reaction_redaction_tasks):
@@ -3159,6 +3259,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
             os.environ[env_name] = str(value)
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
         os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
+    if "self_profile" in matrix_cfg:
+        return {"self_profile": matrix_cfg["self_profile"]}
     return None
 
 

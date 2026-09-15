@@ -3494,3 +3494,57 @@ class TestMatrixPermanentAuthClassifier:
         # or the keyword "forbidden" inside their message can never flip
         # them to permanent.
         assert self._fn()(exc_factory()) is False
+
+
+class TestMatrixSelfProfileConfig:
+    def test_self_profile_requires_explicit_valid_mxc_values(self):
+        from plugins.platforms.matrix.adapter import _resolve_matrix_self_profile_sync
+
+        assert _resolve_matrix_self_profile_sync({}) is None
+        assert _resolve_matrix_self_profile_sync({"self_profile": {"display_name": "  Hermes  "}}) == {
+            "display_name": "Hermes"
+        }
+        assert _resolve_matrix_self_profile_sync({
+            "self_profile": {"avatar_url": "mxc://matrix.example.org:8448/avatar"}
+        }) == {"avatar_url": "mxc://matrix.example.org:8448/avatar"}
+        assert _resolve_matrix_self_profile_sync({
+            "self_profile": {"avatar_url": "mxc://[2001:db8::1]:8448/avatar"}
+        }) == {"avatar_url": "mxc://[2001:db8::1]:8448/avatar"}
+        assert _resolve_matrix_self_profile_sync({
+            "self_profile": {"avatar_url": "mxc://matrix.example.org/"}
+        }) is None
+        assert _resolve_matrix_self_profile_sync({
+            "self_profile": {"avatar_url": "mxc://matrix.example.org:99999/avatar"}
+        }) is None
+        assert _resolve_matrix_self_profile_sync({
+            "self_profile": {"avatar_url": "mxc://2001:db8::1/avatar"}
+        }) is None
+
+    @pytest.mark.asyncio
+    async def test_self_profile_sync_updates_only_changed_values(self):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = _make_adapter()
+        adapter._self_profile_sync = {
+            "display_name": "Hermes",
+            "avatar_url": "mxc://matrix.example.org/avatar",
+        }
+        adapter._user_id = "@bot:example.org"
+        client = MagicMock()
+        client.get_displayname = AsyncMock(return_value="Old Hermes")
+        client.get_avatar_url = AsyncMock(return_value="mxc://matrix.example.org/avatar")
+        client.set_displayname = AsyncMock()
+        client.set_avatar_url = AsyncMock()
+        adapter._client = client
+
+        await adapter._sync_self_profile()
+
+        client.set_displayname.assert_awaited_once_with("Hermes", check_current=False)
+        client.set_avatar_url.assert_not_awaited()
+
+    def test_yaml_self_profile_is_preserved_without_environment_bridge(self):
+        from plugins.platforms.matrix.adapter import _apply_yaml_config
+
+        assert _apply_yaml_config({}, {"self_profile": {"display_name": "Hermes"}}) == {
+            "self_profile": {"display_name": "Hermes"}
+        }

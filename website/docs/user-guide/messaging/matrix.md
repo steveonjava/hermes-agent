@@ -308,7 +308,19 @@ with `_`, duplicate event IDs, old startup events, edit replacement events, and
 your bridge uses a different naming convention:
 
 ```bash
-MATRIX_IGNORE_USER_PATTERNS='^@telegram_,^@slack_,^@whatsapp_'
+MATRIX_IGNORE_USER_PATTERNS='^@telegram_,^@whatsapp_'
+```
+
+### Optional Self-Profile
+
+To synchronize a Matrix account's global display name or an existing `mxc://` avatar, configure the opt-in YAML-only setting below. Hermes does not download or upload avatar media, and configuration is ignored when the value is absent or invalid.
+
+```yaml
+platforms:
+  matrix:
+    self_profile:
+      display_name: Hermes
+      avatar_url: mxc://matrix.example.org/avatar-id
 ```
 
 Only enable notices when a trusted human workflow really sends `m.notice`:
