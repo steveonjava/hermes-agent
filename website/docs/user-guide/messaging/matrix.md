@@ -116,7 +116,7 @@ matrix:
 `self_profile` must be a mapping. Its fields are independent:
 
 - `display_name` is used only when it is a non-empty string; leading and trailing whitespace is removed.
-- `avatar_url` is used only when it is an `mxc://<server>/<media-id>` URI with exactly one non-empty server component and one non-empty media-ID component. Hermes preserves the configured URI exactly and treats it as opaque: it does not fetch, upload, inspect, convert, or proxy media.
+- `avatar_url` is used only when it is an `mxc://<server>/<media-id>` URI with exactly one non-empty server component and one non-empty media-ID component. Whitespace, query (`?`), and fragment (`#`) characters are invalid in either component. Hermes preserves the configured URI exactly and treats it as opaque: it does not fetch, upload, inspect, convert, or proxy media.
 - An absent, empty, non-string, or invalid field is ignored. If neither field is valid, Hermes makes no self-profile API request or write.
 
 After authentication, Hermes reads only its own global Matrix profile. It calls the

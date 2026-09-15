@@ -484,6 +484,16 @@ class TestMatrixSelfProfileSync:
         "mxc://matrix.example.org/",
         "mxc:///media",
         "mxc://matrix.example.org/media/extra",
+        "mxc:// matrix.example.org/media",
+        "mxc://matrix.example.org /media",
+        "mxc://matrix .example.org/media",
+        "mxc://matrix.example.org/ media",
+        "mxc://matrix.example.org/media ",
+        "mxc://matrix.example.org/me dia",
+        "mxc://matrix?query.example.org/media",
+        "mxc://matrix#fragment.example.org/media",
+        "mxc://matrix.example.org/media?query=1",
+        "mxc://matrix.example.org/media#fragment",
     ])
     async def test_malformed_avatar_url_is_ignored_without_profile_calls(self, avatar_url):
         from plugins.platforms.matrix.adapter import MatrixAdapter

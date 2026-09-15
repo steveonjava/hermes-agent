@@ -497,7 +497,10 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
     avatar_url = configured.get("avatar_url")
     if isinstance(avatar_url, str) and avatar_url.startswith("mxc://"):
         server_and_media_id = avatar_url[6:].split("/")
-        if len(server_and_media_id) == 2 and all(part.strip() for part in server_and_media_id):
+        if len(server_and_media_id) == 2 and all(
+            part and not any(char.isspace() or char in "?#" for char in part)
+            for part in server_and_media_id
+        ):
             resolved["avatar_url"] = avatar_url
     return resolved or None
 
