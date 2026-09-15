@@ -517,17 +517,18 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
                 valid_server = closing_bracket > 1 and is_ipv6 and has_valid_port
             else:
                 host, separator, port = server.rpartition(":")
-                valid_server = (
-                    bool(server)
-                    and "@" not in server
-                    and not any(char.isspace() or char in "?#/" for char in server)
-                    and (not separator or (
-                        bool(host) and port.isdigit() and len(port) <= 5 and 0 < int(port) <= 65535
+                hostname = host if separator else server
+                try:
+                    valid_host = ipaddress.ip_address(hostname).version == 4
+                except ValueError:
+                    valid_host = bool(re.fullmatch(
+                        r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*",
+                        hostname,
                     ))
-                )
-            if valid_server and media_id and not any(
-                char.isspace() or char in "?#/" for char in media_id
-            ):
+                valid_server = valid_host and (not separator or (
+                    port.isascii() and port.isdigit() and len(port) <= 5 and 0 < int(port) <= 65535
+                ))
+            if valid_server and bool(re.fullmatch(r"[A-Za-z0-9_-]+", media_id)):
                 resolved["avatar_url"] = avatar_url
     return resolved or None
 
