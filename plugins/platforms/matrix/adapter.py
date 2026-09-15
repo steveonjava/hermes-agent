@@ -507,7 +507,7 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
                 host = server[1:closing_bracket]
                 port = server[closing_bracket + 1:]
                 try:
-                    is_ipv6 = ipaddress.ip_address(host).version == 6
+                    is_ipv6 = "%" not in host and ipaddress.ip_address(host).version == 6
                 except ValueError:
                     is_ipv6 = False
                 has_valid_port = not port or (

@@ -355,6 +355,9 @@ class TestMatrixSelfProfileSync:
             "avatar_url": "mxc://[not-ipv6]/avatar",
         }}) is None
         assert _resolve_matrix_self_profile_sync({"self_profile": {
+            "avatar_url": "mxc://[fe80::1%eth0]/avatar",
+        }}) is None
+        assert _resolve_matrix_self_profile_sync({"self_profile": {
             "avatar_url": "mxc://[2001:db8::1]:²/avatar",
         }}) is None
         assert _resolve_matrix_self_profile_sync({"self_profile": {
