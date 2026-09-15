@@ -511,7 +511,7 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
                 except ValueError:
                     is_ipv6 = False
                 has_valid_port = not port or (
-                    port.startswith(":") and port[1:].isdigit() and len(port[1:]) <= 5
+                    port.startswith(":") and port[1:].isascii() and port[1:].isdigit() and len(port[1:]) <= 5
                     and 0 < int(port[1:]) <= 65535
                 )
                 valid_server = closing_bracket > 1 and is_ipv6 and has_valid_port
@@ -521,7 +521,7 @@ def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] |
                 try:
                     valid_host = ipaddress.ip_address(hostname).version == 4
                 except ValueError:
-                    valid_host = bool(re.fullmatch(
+                    valid_host = len(hostname) <= 255 and bool(re.fullmatch(
                         r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*",
                         hostname,
                     ))
