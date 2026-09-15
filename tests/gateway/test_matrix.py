@@ -478,6 +478,37 @@ class TestMatrixSelfProfileSync:
 
         assert adapter._self_profile_sync == expected
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("avatar_url", [
+        "mxc:///",
+        "mxc://matrix.example.org/",
+        "mxc:///media",
+        "mxc://matrix.example.org/media/extra",
+    ])
+    async def test_malformed_avatar_url_is_ignored_without_profile_calls(self, avatar_url):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        display_name = "Hermes Homelab"
+        adapter = MatrixAdapter(PlatformConfig(extra={"self_profile": {
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+        }}))
+        client = MagicMock()
+        client.get_displayname = AsyncMock(return_value="Old Hermes")
+        client.set_displayname = AsyncMock()
+        client.get_avatar_url = AsyncMock()
+        client.set_avatar_url = AsyncMock()
+        adapter._client = client
+        adapter._user_id = "@hermes:matrix.example.org"
+
+        assert adapter._self_profile_sync == {"display_name": display_name}
+
+        await adapter._sync_self_profile()
+
+        client.set_displayname.assert_awaited_once_with(display_name, check_current=False)
+        client.get_avatar_url.assert_not_awaited()
+        client.set_avatar_url.assert_not_awaited()
+
     def test_yaml_loader_passes_self_profile_from_an_isolated_hermes_home(self, tmp_path, monkeypatch):
         from gateway.config import load_gateway_config
         from plugins.platforms.matrix.adapter import MatrixAdapter
