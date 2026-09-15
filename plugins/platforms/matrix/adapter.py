@@ -485,6 +485,21 @@ def _resolve_e2ee_mode(extra: Optional[Dict[str, Any]] = None) -> str:
     return "required" if legacy_enabled else "off"
 
 
+def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] | None:
+    """Resolve the opt-in global self-profile settings without consulting environment state."""
+    configured = extra.get("self_profile")
+    if not isinstance(configured, dict):
+        return None
+    resolved: dict[str, str] = {}
+    display_name = configured.get("display_name")
+    if isinstance(display_name, str) and display_name.strip():
+        resolved["display_name"] = display_name.strip()
+    avatar_url = configured.get("avatar_url")
+    if isinstance(avatar_url, str) and avatar_url.startswith("mxc://") and avatar_url[6:].strip():
+        resolved["avatar_url"] = avatar_url
+    return resolved or None
+
+
 def _env_truthy(name: str, default: str = "") -> bool:
     """Return True when the env var is one of true/1/yes (case-insensitive)."""
     return str(_get_scoped_secret(name, default)).lower() in ("true", "1", "yes")
@@ -817,6 +832,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._e2ee_mode: str = _resolve_e2ee_mode(config.extra)
         self._encryption: bool = self._e2ee_mode != "off"
         self._device_id: str = config.extra.get("device_id", "") or _get_scoped_secret("MATRIX_DEVICE_ID", "").strip()
+        self._self_profile_sync = _resolve_matrix_self_profile_sync(config.extra)
         self._device_id_unverified: bool = False
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
@@ -1154,6 +1170,28 @@ class MatrixAdapter(BasePlatformAdapter):
             return await self._abort_connect(api)
         return True
 
+    async def _sync_self_profile(self) -> None:
+        """Best-effort global account profile reconciliation for an explicit YAML opt-in."""
+        configured = self._self_profile_sync
+        client = self._client
+        if not configured or not client or not self._user_id:
+            return
+        user_id = UserID(self._user_id)
+        if "display_name" in configured:
+            try:
+                current_name = await client.get_displayname(user_id)
+                if current_name != configured["display_name"]:
+                    await client.set_displayname(configured["display_name"], check_current=False)
+            except Exception as exc:
+                logger.warning("Matrix: global self-profile display-name sync failed: %s", exc)
+        if "avatar_url" in configured:
+            try:
+                current_avatar = await client.get_avatar_url(user_id)
+                if str(current_avatar or "") != configured["avatar_url"]:
+                    await client.set_avatar_url(configured["avatar_url"], check_current=False)
+            except Exception as exc:
+                logger.warning("Matrix: global self-profile avatar sync failed: %s", exc)
+
     async def _connect_setup_e2ee(self, client: Any, api: Any, state_store: Any) -> bool:
         """Set up the Olm machine + crypto store. Returns False when connect must abort."""
         if not _check_e2ee_deps():
@@ -1311,6 +1349,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._client = client
         if not await self._connect_authenticate(client, api):
             return False
+        await self._sync_self_profile()
         if self._encryption and not await self._connect_setup_e2ee(client, api, state_store):
             return False
         from mautrix.client import InternalEventType as IntEvt
@@ -2998,9 +3037,11 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
 
 
 def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
-    """``apply_yaml_config_fn`` (#24849): config.yaml matrix: keys → MATRIX_* env (env wins; skipped under a
-    multiplexed secondary profile's scope) + ``PlatformConfig.extra`` (extra-first readers)."""
-    return _apply_yaml_bridge(matrix_cfg, _YAML_BRIDGE)
+    """Bridge Matrix YAML into adapter config without exporting profile presentation settings."""
+    seeded = _apply_yaml_bridge(matrix_cfg, _YAML_BRIDGE) or {}
+    if "self_profile" in matrix_cfg:
+        seeded["self_profile"] = matrix_cfg["self_profile"]
+    return seeded or None
 
 
 
