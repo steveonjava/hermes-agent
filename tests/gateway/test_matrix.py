@@ -470,6 +470,56 @@ class TestMatrixSelfProfileSync:
         assert "global self-profile avatar sync failed" in caplog.text
 
     @pytest.mark.asyncio
+    async def test_display_name_failure_redacts_runtime_esc_and_configured_values(self, caplog):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        display_name = "Display Sentinel"
+        avatar_url = "mxc://matrix.example.org/avatar-sentinel"
+        payload = f"{display_name}|{avatar_url}|\x1b[31m"
+        adapter = MatrixAdapter(PlatformConfig(extra={"self_profile": {
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+        }}))
+        client = MagicMock()
+        client.get_displayname = AsyncMock(side_effect=RuntimeError(payload))
+        client.get_avatar_url = AsyncMock(return_value=avatar_url)
+        client.set_avatar_url = AsyncMock()
+        adapter._client = client
+        adapter._user_id = "@hermes:matrix.example.org"
+
+        await adapter._sync_self_profile()
+
+        assert "global self-profile display-name sync failed" in caplog.text
+        assert display_name not in caplog.text
+        assert avatar_url not in caplog.text
+        assert "\x1b" not in caplog.text
+        client.set_avatar_url.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_avatar_failure_redacts_runtime_esc_and_configured_values(self, caplog):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        display_name = "Avatar Sentinel"
+        avatar_url = "mxc://matrix.example.org/avatar-sentinel"
+        payload = f"{display_name}|{avatar_url}|\x1b[31m"
+        adapter = MatrixAdapter(PlatformConfig(extra={"self_profile": {
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+        }}))
+        client = MagicMock()
+        client.get_displayname = AsyncMock(return_value=display_name)
+        client.get_avatar_url = AsyncMock(side_effect=RuntimeError(payload))
+        adapter._client = client
+        adapter._user_id = "@hermes:matrix.example.org"
+
+        await adapter._sync_self_profile()
+
+        assert "global self-profile avatar sync failed" in caplog.text
+        assert display_name not in caplog.text
+        assert avatar_url not in caplog.text
+        assert "\x1b" not in caplog.text
+
+    @pytest.mark.asyncio
     async def test_connect_syncs_profile_after_required_e2ee_setup(self):
         from plugins.platforms.matrix.adapter import MatrixAdapter
 

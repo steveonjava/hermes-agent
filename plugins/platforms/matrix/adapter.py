@@ -1382,8 +1382,8 @@ class MatrixAdapter(BasePlatformAdapter):
                         client.set_displayname(configured["display_name"], check_current=False),
                         timeout=_SELF_PROFILE_SYNC_TIMEOUT_SECONDS,
                     )
-            except Exception as exc:
-                logger.warning("Matrix: global self-profile display-name sync failed: %s", exc)
+            except Exception:
+                logger.warning("Matrix: global self-profile display-name sync failed")
         if "avatar_url" in configured:
             try:
                 current_avatar = await asyncio.wait_for(
@@ -1394,8 +1394,8 @@ class MatrixAdapter(BasePlatformAdapter):
                         client.set_avatar_url(configured["avatar_url"], check_current=False),
                         timeout=_SELF_PROFILE_SYNC_TIMEOUT_SECONDS,
                     )
-            except Exception as exc:
-                logger.warning("Matrix: global self-profile avatar sync failed: %s", exc)
+            except Exception:
+                logger.warning("Matrix: global self-profile avatar sync failed")
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._device_id_unverified = False
