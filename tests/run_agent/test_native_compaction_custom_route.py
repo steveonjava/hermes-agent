@@ -49,7 +49,7 @@ def route_config(monkeypatch, tmp_path):
 def make_agent(config, model=MODELS[0]):
     from hermes_constants import get_hermes_home
 
-    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(config))
+    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
 
     runtime = resolve_runtime_provider(requested="custom:chatgpt-tier")
     assert runtime["base_url"] == RELAY
@@ -303,4 +303,3 @@ def test_auxiliary_inherits_subscription_runtime(route_config):
     assert model == parent.model
     assert isinstance(client, CodexAuxiliaryClient)
     assert str(client.base_url).rstrip("/") == RELAY
-
