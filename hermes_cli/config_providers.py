@@ -284,7 +284,7 @@ def _custom_provider_entry_to_provider_config(
     provider_entry: Dict[str, Any] = {"api": normalized["base_url"]}
     for field in (
         "name", "api_key", "key_env", "key_cmd", "models", "models_discovered", "context_length",
-        "rate_limit_delay", "discover_models", "extra_body", "extra_headers",
+        "rate_limit_delay", "discover_models", "extra_body", "extra_headers", "capabilities",
         "ssl_ca_cert", "ssl_verify"):
         if field in normalized:
             provider_entry[field] = normalized[field]

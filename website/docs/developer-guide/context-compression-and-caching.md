@@ -330,7 +330,7 @@ Hermes' local transcript is never rewritten on this runtime — state.db records
 the compaction boundary while the visible transcript stays intact. All other
 routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
 
-### Native Responses compaction (gpt-5.6 on direct OpenAI / Codex subscription)
+### Native Responses compaction (direct OpenAI or approved Responses routes)
 
 OpenAI's Responses API supports server-side compaction: when a request includes
 `context_management: [{type: "compaction", compact_threshold: N}]` and the
@@ -344,12 +344,49 @@ client-side summary pass, and ZDR-friendly (`store: false`, no
 Opt in with `compression.codex_responses_native: true`. The gate is deliberately
 narrow, re-checked on every request:
 
-- **Models:** the gpt-5.6 family only. Other models fail server-side when the
-  field is present (gpt-5.1/5.2 return HTTP 500 or stall the stream — there is
-  no structured rejection to downgrade on, verified live Aug 2026).
+- **Models:** the gpt-5.6 family by default. The exact subscription aliases
+  `gpt-6.1-sol-chatgpt-tier` and `gpt-6-luna-chatgpt-tier` additionally work
+  on explicitly approved routes. This is not a wildcard GPT-6 family gate.
+  Legacy gpt-5.1/5.2 remain excluded: they return HTTP 500 or stall the stream
+  without a structured rejection (verified live Aug 2026).
 - **Routes:** `api.openai.com` (OpenAI API key) or the ChatGPT Codex backend
-  (Codex subscription OAuth) only. xAI, GitHub/Copilot, OpenRouter, relays, and
-  local servers never see the field.
+  (Codex subscription OAuth) by default. A named custom Responses provider may
+  explicitly declare `capabilities.openai_native_compaction: true`. Missing,
+  false or non-boolean values do not approve a relay. xAI and GitHub/Copilot
+  remain excluded even with the declaration.
+
+Approve only a route that passes actual checkpoint issuance and encrypted-item
+replay, including a tool turn and disposable-session resume. An HTTP 200 on a
+tiny request is not evidence that a relay supports compaction. For example:
+
+```yaml
+providers:
+  chatgpt-tier:
+    api: https://approved-responses-relay.example/v1
+    transport: codex_responses
+    capabilities:
+      openai_native_compaction: true
+compression:
+  enabled: true
+  threshold: 0.5
+  codex_responses_native: true
+  codex_responses_compact_threshold: 220000
+```
+
+The same capability works on legacy `custom_providers` entries and survives
+conversion to the keyed schema. Runtime model switches and fallback use the
+existing destination-capability resolution; approvals are not global. Neither
+`request_overrides.context_management` nor `extra_body.context_management`
+can override the native gate or keep sending a rejected directive.
+
+Rollout is separate from verification: review and approve the code/config
+first, then reload the owning CLI/gateway processes and verify the resolved
+runtime's outgoing directive. Existing agents do not hot-reload capabilities.
+For a cost boundary below 280K, use an absolute threshold such as 220000 with
+sufficient input/output headroom; automatic mode follows the local trigger and
+may be much higher on a 1M window. Test with a lowered threshold only in a new
+disposable `HERMES_HOME`, never by compacting a live conversation or changing
+the production threshold. No new paid fallback is necessary.
 
 Everything else about compression is unchanged: the local compressor stays
 armed as the fallback owner (the native threshold is clamped ~8K tokens below
