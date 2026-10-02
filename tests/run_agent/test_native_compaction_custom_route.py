@@ -12,7 +12,25 @@ from hermes_cli.runtime_provider import resolve_runtime_provider
 from run_agent import AIAgent
 
 
-MODELS = ("gpt-6.1-sol-chatgpt-tier", "gpt-6-luna-chatgpt-tier")
+MODELS = (
+    "gpt-6.1-sol-chatgpt-tier",
+    "gpt-6-luna-chatgpt-tier",
+    "gpt-6",
+    "gpt-6.1-sol",
+    "gpt-6-luna",
+    "gpt-6-terra",
+    "gpt-6-astra-900k",
+    "gpt-6.2-future",
+    "gpt-6.9-future-mini-2027-01-01",
+    "gpt-6-unknown",
+    "gpt-6future",
+    "gpt-6-terra-chatgpt-tier",
+    "gpt-6.2-future-chatgpt-tier",
+    "openai/gpt-6",
+    "OpenAI/GPT-6.1-SOL",
+    "vendor/nested/gpt-6.2-future-chatgpt-tier",
+    " OPENAI/GPT-6-LUNA-CHATGPT-TIER ",
+)
 RELAY = "http://litellm.browsecode.org:4000"
 DIRECTIVE = [{"type": "compaction", "compact_threshold": 220_000}]
 
@@ -39,7 +57,10 @@ def route_config(monkeypatch, tmp_path):
             "api_key": "test-key",
             "api_mode": "codex_responses",
             "model": MODELS[0],
-            "models": {model: {"context_length": 1_000_000} for model in MODELS},
+            "models": {
+                model.strip(): {"context_length": 1_000_000}
+                for model in (*MODELS, "gpt-6.9-future", "gpt-7")
+            },
             "capabilities": {"openai_native_compaction": True},
         }],
     }
@@ -74,47 +95,56 @@ def test_opted_in_named_route_sends_native_directive(route_config, model, format
         entry = route_config.pop("custom_providers")[0]
         route_config["providers"] = {"chatgpt-tier": entry}
     agent = make_agent(route_config, model)
+    assert agent.runtime_capabilities["native_compaction"] is True
     assert agent._build_api_kwargs([{"role": "user", "content": "hi"}])["context_management"] == DIRECTIVE
     assert agent.context_compressor.threshold_tokens == 500_000
 
 
 @pytest.mark.parametrize("capability", (None, False, "true", 1, {}, []))
-def test_capability_absent_or_malformed_fails_closed(route_config, capability):
+@pytest.mark.parametrize("model", (MODELS[0], "gpt-6.2-future", "OpenAI/GPT-6.1-SOL"))
+def test_capability_absent_or_malformed_fails_closed(route_config, capability, model):
     route_config["custom_providers"][0]["capabilities"] = {
         "openai_native_compaction": capability
     }
-    agent = make_agent(route_config)
+    agent = make_agent(route_config, model)
+    assert agent.runtime_capabilities["native_compaction"] is False
     assert "context_management" not in agent._build_api_kwargs([{"role": "user", "content": "hi"}])
 
 
-@pytest.mark.parametrize("model", ("gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-6-unknown", "claude-tier"))
+@pytest.mark.parametrize("model", (
+    "gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-5.7",
+    "gpt-7", "openai/GPT-7.1-sol", "claude-tier", "not-gpt-6-terra", "gpt-6/claude-tier",
+))
 def test_capability_does_not_enable_unsupported_models(route_config, model):
     agent = make_agent(route_config, model)
     assert "context_management" not in agent._build_api_kwargs([{"role": "user", "content": "hi"}])
 
 
 @pytest.mark.parametrize("key", ("enabled", "codex_responses_native"))
-def test_compression_kill_switch_wins_over_custom_extra_body(route_config, key):
+@pytest.mark.parametrize("model", (MODELS[0], "gpt-6.2-future"))
+def test_compression_kill_switch_wins_over_custom_extra_body(route_config, key, model):
     route_config["compression"][key] = False
     entry = route_config["custom_providers"][0]
     entry["extra_body"] = {"context_management": DIRECTIVE, "custom_field": "kept"}
-    agent = make_agent(route_config)
+    agent = make_agent(route_config, model)
     kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
     assert "context_management" not in kwargs
     assert kwargs["extra_body"] == {"custom_field": "kept"}
     assert agent.request_overrides["extra_body"]["context_management"] == DIRECTIVE
 
 
-def test_route_switch_does_not_carry_capability(route_config):
-    agent = make_agent(route_config)
+@pytest.mark.parametrize("model", (MODELS[0], "gpt-6.2-future"))
+def test_route_switch_does_not_carry_capability(route_config, model):
+    agent = make_agent(route_config, model)
     agent.switch_model(new_model=agent.model, new_provider="custom:unapproved",
                        base_url="http://unapproved-relay:4000", api_key="test-key",
                        api_mode="codex_responses")
     assert "context_management" not in agent._build_api_kwargs([{"role": "user", "content": "hi"}])
 
 
-def test_named_provider_switch_on_same_endpoint_does_not_carry_capability(route_config):
-    agent = make_agent(route_config)
+@pytest.mark.parametrize("model", (MODELS[0], "gpt-6.2-future"))
+def test_named_provider_switch_on_same_endpoint_does_not_carry_capability(route_config, model):
+    agent = make_agent(route_config, model)
     agent.switch_model(new_model=agent.model, new_provider="custom:unapproved",
                        base_url=RELAY, api_key="test-key", api_mode="codex_responses")
     assert "context_management" not in agent._build_api_kwargs([{"role": "user", "content": "hi"}])
@@ -168,6 +198,41 @@ def test_route_api_mode_case_normalization_matches_resolver(route_config):
     assert agent._build_api_kwargs([{"role": "user", "content": "hi"}])["context_management"] == DIRECTIVE
 
 
+@pytest.mark.parametrize("model", ("gpt-6", "gpt-6.2-future", "OpenAI/GPT-6.1-SOL"))
+@pytest.mark.parametrize(("provider", "base_url"), (
+    ("openai", "https://api.openai.com/v1"),
+    ("openai-codex", "https://chatgpt.com/backend-api/codex"),
+))
+def test_family_on_direct_openai_route_needs_no_proxy_approval(route_config, model, provider, base_url):
+    route_config["custom_providers"].append({
+        "name": "direct-test", "base_url": base_url,
+        "api_mode": "codex_responses", "api_key": "test-key",
+        "models": {model.strip(): {"context_length": 1_000_000}},
+    })
+    agent = make_agent(route_config, model)
+    agent.switch_model(
+        new_model=model, new_provider=provider, base_url=base_url,
+        api_key="test-key", api_mode="codex_responses",
+    )
+    assert agent.capabilities.get("openai_native_compaction") is not True
+    assert agent.runtime_capabilities["native_compaction"] is True
+    assert agent._build_api_kwargs([{"role": "user", "content": "hi"}])["context_management"] == DIRECTIVE
+
+
+@pytest.mark.parametrize("api_mode", ("chat_completions", "anthropic_messages"))
+def test_family_capability_cannot_enable_non_responses_transport(route_config, api_mode):
+    route_config["custom_providers"][0]["api_mode"] = api_mode
+    agent = make_agent(route_config, "gpt-6.2-future")
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+    assert "context_management" not in kwargs
+
+
+def test_family_checkpoint_required_suppresses_directive(route_config):
+    route_config["compression"]["checkpoint_required"] = True
+    agent = make_agent(route_config, "gpt-6.2-future")
+    assert "context_management" not in agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+
 @pytest.mark.parametrize("model", MODELS)
 def test_real_sdk_wire_contains_only_gated_directive(route_config, model):
     import httpx
@@ -192,12 +257,13 @@ def test_real_sdk_wire_contains_only_gated_directive(route_config, model):
 
 
 @pytest.mark.parametrize("rejected_parameter", ("context_management", "compact_threshold"))
-def test_rejection_retries_once_and_remains_off(route_config, monkeypatch, rejected_parameter):
+@pytest.mark.parametrize("model", (MODELS[0], "gpt-6.2-future"))
+def test_rejection_retries_once_and_remains_off(route_config, monkeypatch, rejected_parameter, model):
     import httpx
     from openai import BadRequestError
 
     route_config["custom_providers"][0]["extra_body"] = {"context_management": DIRECTIVE}
-    agent = make_agent(route_config)
+    agent = make_agent(route_config, model)
     agent._disable_streaming = True
     captured = []
 
@@ -227,11 +293,12 @@ def test_rejection_retries_once_and_remains_off(route_config, monkeypatch, rejec
     assert "context_management" not in captured[2]
 
 
-def test_checkpoint_persistence_endpoint_binding_and_kill_switch(route_config, tmp_path):
+@pytest.mark.parametrize("model", (MODELS[0], "gpt-6.2-future"))
+def test_checkpoint_persistence_endpoint_binding_and_kill_switch(route_config, tmp_path, model):
     from agent.codex_responses_adapter import _normalize_codex_response
     from hermes_state import SessionDB
 
-    agent = make_agent(route_config)
+    agent = make_agent(route_config, model)
     agent._build_api_kwargs([{"role": "user", "content": "seed"}])
     issuer = agent._get_transport()._last_issuer_kind
     raw = SimpleNamespace(status="completed", output=[
@@ -249,6 +316,34 @@ def test_checkpoint_persistence_endpoint_binding_and_kill_switch(route_config, t
     same = agent._build_api_kwargs(history)
     assert any(i.get("type") == "compaction" for i in same["input"])
     assert "_issuer_kind" not in json.dumps(same["input"])
+    switch_kwargs = {
+        "new_provider": "custom:chatgpt-tier", "base_url": RELAY,
+        "api_key": "test-key", "api_mode": "codex_responses",
+        "provider_capabilities": agent.capabilities,
+    }
+    agent.switch_model(new_model="gpt-6.9-future", **switch_kwargs)
+    switched = agent._build_api_kwargs(history)
+    assert switched["context_management"] == DIRECTIVE
+    assert any(i.get("type") == "compaction" for i in switched["input"])
+    agent.switch_model(new_model="gpt-7", **switch_kwargs)
+    incompatible = agent._build_api_kwargs(history)
+    assert "context_management" not in incompatible
+    assert not any(i.get("type") == "compaction" for i in incompatible["input"])
+    agent.switch_model(new_model=model, **switch_kwargs)
+    resumed = make_agent(route_config, model)._build_api_kwargs(history)
+    assert resumed["context_management"] == DIRECTIVE
+    assert any(i.get("type") == "compaction" for i in resumed["input"])
+    for flag in ("compression_enabled", "codex_responses_native_compaction"):
+        setattr(agent, flag, False)
+        suppressed = agent._build_api_kwargs(history)
+        assert "context_management" not in suppressed
+        assert not any(i.get("type") == "compaction" for i in suppressed["input"])
+        setattr(agent, flag, True)
+    agent.compression_checkpoint_required = True
+    checkpoint_required = agent._build_api_kwargs(history)
+    assert "context_management" not in checkpoint_required
+    assert not any(i.get("type") == "compaction" for i in checkpoint_required["input"])
+    agent.compression_checkpoint_required = False
     agent.base_url = "http://foreign-issuer:4000"
     foreign = agent._build_api_kwargs(history)
     assert not any(i.get("type") == "compaction" for i in foreign["input"])
@@ -259,8 +354,9 @@ def test_checkpoint_persistence_endpoint_binding_and_kill_switch(route_config, t
     assert not any(i.get("type") == "compaction" for i in disabled["input"])
 
 
-def test_anthropic_fallback_wire_has_no_encrypted_checkpoint(route_config):
-    agent = make_agent(route_config)
+@pytest.mark.parametrize("model", (MODELS[0], "gpt-6.2-future"))
+def test_anthropic_fallback_wire_has_no_encrypted_checkpoint(route_config, model):
+    agent = make_agent(route_config, model)
     agent._build_api_kwargs([{"role": "user", "content": "seed"}])
     history = [
         {"role": "user", "content": "seed"},
@@ -281,10 +377,11 @@ def test_anthropic_fallback_wire_has_no_encrypted_checkpoint(route_config):
     assert history == original
 
 
-def test_inherited_delegate_uses_native_route_without_new_routing(route_config):
+@pytest.mark.parametrize("model", (MODELS[0], "gpt-6.2-future"))
+def test_inherited_delegate_uses_native_route_without_new_routing(route_config, model):
     from tools.delegate_tool import _build_child_agent
 
-    parent = make_agent(route_config)
+    parent = make_agent(route_config, model)
     child = _build_child_agent(
         task_index=0, goal="Reply DONE", context=None, toolsets=None,
         model=None, max_iterations=2, task_count=1, parent_agent=parent,

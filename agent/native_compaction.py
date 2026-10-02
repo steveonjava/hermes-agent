@@ -2,10 +2,10 @@
 
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` makes the server
 summarize older context into an opaque ``compaction`` item once the input crosses N tokens.
-Deliberately narrow (live-verified): gpt-5.6 by default, plus verified GPT-6 subscription
-aliases only with explicit route approval (5.1/5.2 remain unsupported). The local compressor
-stays armed as fallback (native threshold clamped below the local trigger); compaction items
-ride the ``codex_reasoning_items`` sidecar. No transport imports (shared gate, no cycles).
+The model gate allows GPT-5.6 and GPT-6* on direct OpenAI/Codex or explicitly approved
+Responses routes (5.1/5.2 remain unsupported). Family eligibility is not live route verification.
+The local compressor stays armed as fallback (native threshold clamped below the local trigger).
+Compaction items ride the ``codex_reasoning_items`` sidecar. No transport imports (shared gate, no cycles).
 """
 
 from __future__ import annotations
@@ -25,18 +25,12 @@ LOCAL_TRIGGER_SAFETY_MARGIN = 8_192
 DEFAULT_COMPACT_THRESHOLD = 200_000
 # Substring match so dated snapshots and variants (gpt-5.6-mini) stay eligible.
 _ELIGIBLE_MODEL_MARKER = "gpt-5.6"
-_TRUSTED_PROXY_MODEL_ALIASES = frozenset({
-    "gpt-6.1-sol-chatgpt-tier",
-    "gpt-6-luna-chatgpt-tier",
-})
 
 
-def is_native_compaction_model(model: Optional[str], *, trusted_proxy: bool = False) -> bool:
-    """Allow GPT-5.6, or verified subscription aliases on an explicitly approved route."""
-    normalized = (model or "").lower()
-    return _ELIGIBLE_MODEL_MARKER in normalized or (
-        trusted_proxy is True and normalized in _TRUSTED_PROXY_MODEL_ALIASES
-    )
+def is_native_compaction_model(model: Optional[str]) -> bool:
+    """Allow GPT-5.6 and GPT-6*; route approval is a separate gate."""
+    normalized = (model or "").strip().lower()
+    return _ELIGIBLE_MODEL_MARKER in normalized or normalized.rsplit("/", 1)[-1].startswith("gpt-6")
 
 
 def resolve_native_compaction_capabilities(
@@ -50,7 +44,7 @@ def resolve_native_compaction_capabilities(
         isinstance(provider_capabilities, dict)
         and provider_capabilities.get("openai_native_compaction") is True
     )
-    return {"native_compaction": is_native_compaction_model(model, trusted_proxy=trusted_proxy) and (
+    return {"native_compaction": is_native_compaction_model(model) and (
         direct_default or is_direct_openai_route(base_url, is_codex_backend=is_codex_backend) or trusted_proxy)}
 
 
@@ -129,9 +123,7 @@ def native_compaction_context_management(agent: Any, *, is_codex_backend: bool, 
         _warn_native_compaction_suppressed_by_checkpoint_gate()
         return None
     trusted_proxy = getattr(agent, "capabilities", {}).get("openai_native_compaction") is True
-    if is_xai_responses or is_github_responses or not is_native_compaction_model(
-        getattr(agent, "model", None), trusted_proxy=trusted_proxy,
-    ):
+    if is_xai_responses or is_github_responses or not is_native_compaction_model(getattr(agent, "model", None)):
         return None
     if not trusted_proxy and not is_direct_openai_route(getattr(agent, "base_url", None), is_codex_backend=is_codex_backend):
         return None
