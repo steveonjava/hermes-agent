@@ -36,6 +36,9 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
     command_dir = tmp_path / "command"
     minimal_path = tmp_path / "minimal-path"
     result = tmp_path / "launch-result"
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".bashrc").write_text("# disposable shell config\n", encoding="utf-8")
     venv_bin.mkdir(parents=True)
     minimal_path.mkdir()
 
@@ -45,7 +48,9 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
 
     _make_executable(
         venv_bin / "python",
-        '#!/bin/sh\nprintf "%s\\n" "$@" > "$LAUNCH_RESULT"\n',
+        '#!/bin/sh\n'
+        '[ -z "${PYTHONPATH+x}" ] && [ -z "${PYTHONHOME+x}" ] || exit 91\n'
+        'printf "%s\\n" "$@" > "$LAUNCH_RESULT"\n',
     )
     (install_dir / "hermes").write_text("# source entrypoint\n", encoding="utf-8")
     _make_executable(
@@ -63,6 +68,7 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
             'get_command_link_display_dir() { printf "%s" "$COMMAND_LINK_DIR"; }',
             "log_info() { :; }",
             "log_success() { :; }",
+            "log_warn() { :; }",
             _setup_path_function(),
             "setup_path",
         ]
@@ -71,13 +77,17 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
         "USE_VENV": "true",
         "INSTALL_DIR": str(install_dir),
         "DISTRO": "macos",
+        "ROOT_FHS_LAYOUT": "false",
+        "HOME": str(home),
+        "SHELL": "/bin/bash",
         "COMMAND_LINK_DIR": str(command_dir),
     }
     subprocess.run(["/bin/bash", "-c", harness], env=env, check=True)
 
     completed = subprocess.run(
         [command_dir / "hermes", "--version"],
-        env=os.environ | {"LAUNCH_RESULT": str(result)},
+        env=os.environ | {"LAUNCH_RESULT": str(result), "HOME": str(home),
+                          "PYTHONPATH": "/fixture/unrelated", "PYTHONHOME": "/fixture/unrelated"},
         text=True,
         capture_output=True,
     )
