@@ -13,13 +13,11 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
-    #
-    # Use the public hosted runner so this required gate cannot remain queued
-    # behind unavailable private large-runner capacity.
+    name: Run tests (shard ${{ matrix.slice }}/4)
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -92,33 +90,71 @@ jobs:
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
         #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
+        # Each fresh checkout uses identical tracked duration inputs. Do not
+        # restore a mutable duration cache before the runner partitions files.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          workers=$(python - <<'PY'
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import sys
+
+          limits = [4]
+          measurements = {}
+          try:
+              online = os.sysconf('SC_NPROCESSORS_ONLN')
+              affinity = len(os.sched_getaffinity(0))
+              if online < 1 or affinity < 1:
+                  raise ValueError('No usable CPUs')
+              limits.extend((online, affinity))
+              measurements.update(online=online, affinity=affinity)
+          except (OSError, ValueError) as exc:
+              measurements['cpu_error'] = str(exc)
+              limits.append(1)
+          try:
+              groups = [line.split(':', 2) for line in Path('/proc/self/cgroup').read_text(encoding='utf-8').splitlines()]
+              root = Path('/sys/fs/cgroup')
+              v2 = (root / 'cgroup.controllers').exists()
+              if v2:
+                  relative = next(path for _, controllers, path in groups if not controllers)
+              else:
+                  relative = next(path for _, controllers, path in groups if 'cpu' in controllers.split(','))
+                  root = next(path for path in (root / 'cpu', root / 'cpu,cpuacct') if path.exists())
+              current = (root / relative.lstrip('/')).resolve()
+              if not current.is_relative_to(root) or not current.exists():
+                  current = root
+              quotas = {}
+              for directory in (current, *current.parents):
+                  if not directory.is_relative_to(root):
+                      continue
+                  if v2:
+                      quota, period = (directory / 'cpu.max').read_text(encoding='utf-8').split()
+                  else:
+                      quota = (directory / 'cpu.cfs_quota_us').read_text(encoding='utf-8').strip()
+                      period = (directory / 'cpu.cfs_period_us').read_text(encoding='utf-8').strip()
+                  period = int(period)
+                  if period <= 0:
+                      raise ValueError('Invalid CPU quota period')
+                  quotas[str(directory)] = [quota, period]
+                  if quota not in ('max', '-1'):
+                      capacity = int(quota) / period
+                      if capacity <= 0:
+                          raise ValueError('Invalid CPU quota')
+                      limits.append(capacity)
+              measurements['cgroup_quotas'] = quotas
+          except (OSError, ValueError, StopIteration) as exc:
+              measurements['quota_error'] = str(exc)
+              limits.append(1)
+          workers = max(1, math.floor(min(limits)))
+          measurements['workers'] = workers
+          print(json.dumps(measurements, sort_keys=True), file=sys.stderr)
+          print(workers)
+          PY
+          )
+          scripts/run_tests.sh -j "$workers" --slice "${{ matrix.slice }}/4"
         env:
-          # This is the maximum number of test FILES that run together.
-          # run_tests_parallel.py starts one pytest subprocess for each file
-          # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # default is cpu_count*2, which is 192 here.
-          #
-          # Measured on this runner (96-core EPYC 7763, 377GB). Whole suite,
-          # two repetitions for each value. See run 32549672063:
-          #
-          #     workers   x cores   mean
-          #        48       0.5x    138s
-          #        96       1.0x    126s   <- fastest
-          #       144       1.5x    132s
-          #       192       2.0x    132s
-          #       240       2.5x    140s
-          #       288       3.0x    142s
-          #
-          # One worker for each core wins. The curve is shallow: 126s to 142s
-          # across a 6x range. The suite has sufficient concurrency at this
-          # size. The remaining time is the slowest files plus the setup.
-          # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
