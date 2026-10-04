@@ -201,7 +201,7 @@ auxiliary:
 | `codex_gpt55_autoraise` | `true` | bool | Raise the trigger to 85% for gpt-5.4/5.5/5.6 and gpt-6 Astra on the ChatGPT Codex OAuth route (see below). Set `false` to keep the global `threshold` |
 | `codex_gpt55_autoraise_notice` | `true` | bool | Show the one-time Codex gpt-5.5 autoraise notice. Set `false` to keep the 85% autoraise but suppress the banner |
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
-| `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Engages only for gpt-5.6-family models on the direct OpenAI API or a ChatGPT Codex subscription (see below) |
+| `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Allows GPT-5.6 and GPT-6* on direct OpenAI/Codex or explicitly approved Responses routes (see below) |
 | `codex_responses_compact_threshold` | `null` | `null` or positive integer | `null` follows the resolved local compression trigger with an 8,192 token safety margin. A positive integer remains absolute and only clamps downward when required. Invalid values use automatic behavior. Automatic mode falls back to `200000` when no usable local trigger exists |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
 
@@ -330,7 +330,7 @@ Hermes' local transcript is never rewritten on this runtime — state.db records
 the compaction boundary while the visible transcript stays intact. All other
 routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
 
-### Native Responses compaction (gpt-5.6 on direct OpenAI / Codex subscription)
+### Native Responses compaction (direct OpenAI or approved Responses routes)
 
 OpenAI's Responses API supports server-side compaction: when a request includes
 `context_management: [{type: "compaction", compact_threshold: N}]` and the
@@ -344,12 +344,67 @@ client-side summary pass, and ZDR-friendly (`store: false`, no
 Opt in with `compression.codex_responses_native: true`. The gate is deliberately
 narrow, re-checked on every request:
 
-- **Models:** the gpt-5.6 family only. Other models fail server-side when the
-  field is present (gpt-5.1/5.2 return HTTP 500 or stall the stream — there is
-  no structured rejection to downgrade on, verified live Aug 2026).
+- **Models:** the gpt-5.6 family and any model whose normalized model portion
+  starts with `gpt-6`, including versioned names, future variants and subscription
+  aliases. The gate strips surrounding whitespace, ignores case and checks the
+  final component of vendor-qualified names such as `openai/gpt-6.1-sol`.
+  Legacy gpt-5.1/5.2 remain excluded: they return HTTP 500 or stall the stream
+  without a structured rejection (verified live Aug 2026).
 - **Routes:** `api.openai.com` (OpenAI API key) or the ChatGPT Codex backend
-  (Codex subscription OAuth) only. xAI, GitHub/Copilot, OpenRouter, relays, and
-  local servers never see the field.
+  (Codex subscription OAuth) by default. A named custom Responses provider may
+  explicitly declare `capabilities.openai_native_compaction: true`. Missing,
+  false or non-boolean values do not approve a relay. xAI and GitHub/Copilot
+  remain excluded even with the declaration.
+
+Approve only a route that passes actual checkpoint issuance and encrypted-item
+replay, including a tool turn and disposable-session resume. An HTTP 200 on a
+tiny request is not evidence that a relay supports compaction. GPT-6* model
+eligibility does not mean every variant or remote route has been live-tested.
+For example:
+
+```yaml
+providers:
+  chatgpt-tier:
+    api: https://approved-responses-relay.example/v1
+    transport: codex_responses
+    capabilities:
+      openai_native_compaction: true
+compression:
+  enabled: true
+  threshold: 0.5
+  codex_responses_native: true
+  codex_responses_compact_threshold: 220000
+```
+
+The same capability works on legacy `custom_providers` entries and survives
+conversion to the keyed schema. Runtime model switches and fallback use the
+existing destination-capability resolution; approvals are not global. Neither
+`request_overrides.context_management` nor `extra_body.context_management`
+can override the native gate or keep sending a rejected directive.
+
+This extends the native transport and replay sidecar introduced upstream in
+merged [#81747](https://github.com/NousResearch/hermes-agent/pull/81747).
+Upstream also added Astra eligibility and reused its canonical alias helper in
+merged [#115890](https://github.com/NousResearch/hermes-agent/pull/115890) and
+[#123969](https://github.com/NousResearch/hermes-agent/pull/123969).
+Related open work includes exact Sol eligibility in
+[#129364](https://github.com/NousResearch/hermes-agent/pull/129364), trusted
+proxy resolution in [#98858](https://github.com/NousResearch/hermes-agent/pull/98858),
+named-provider switching in
+[#106321](https://github.com/NousResearch/hermes-agent/pull/106321), and John Paul
+Soliva's legacy capability migration in
+[#126468](https://github.com/NousResearch/hermes-agent/pull/126468).
+The narrower Sol/Luna proposal
+[#120583](https://github.com/NousResearch/hermes-agent/pull/120583) closed unmerged.
+
+Rollout is separate from verification: review and approve the code/config
+first, then reload the owning CLI/gateway processes and verify the resolved
+runtime's outgoing directive. Existing agents do not hot-reload capabilities.
+For a cost boundary below 280K, use an absolute threshold such as 220000 with
+sufficient input/output headroom; automatic mode follows the local trigger and
+may be much higher on a 1M window. Test with a lowered threshold only in a new
+disposable `HERMES_HOME`, never by compacting a live conversation or changing
+the production threshold. No new paid fallback is necessary.
 
 Everything else about compression is unchanged: the local compressor stays
 armed as the fallback owner (the native threshold is clamped ~8K tokens below

@@ -101,33 +101,51 @@ def test_broken_dotenv_crashes_main_import_without_repair(tmp_path):
 
 
 
-def test_early_recovery_module_is_stdlib_only(tmp_path):
-    """The module must import in a process where every non-stdlib import
-    fails — that is the whole point of its existence."""
+_STDLIB_GUARD = textwrap.dedent(
+    """
+    import builtins
+    import sys
+
+    STDLIB = set(sys.stdlib_module_names) | {"hermes_cli"}
+    real_import = builtins.__import__
+
+    def guard(name, globals=None, locals=None, fromlist=(), level=0):
+        qualified = name
+        if level > 0:
+            namespace = globals or {}
+            package = namespace.get("__package__")
+            if package is None:
+                spec = namespace.get("__spec__")
+                if spec is not None:
+                    package = spec.parent
+                else:
+                    package = namespace.get("__name__", "")
+                    if "__path__" not in namespace:
+                        package = package.rpartition(".")[0]
+            if not package:
+                raise ImportError("attempted relative import with no known parent package")
+            parts = package.rsplit(".", level - 1)
+            if len(parts) < level:
+                raise ImportError("attempted relative import beyond top-level package")
+            qualified = parts[0] + ("." + name if name else "")
+        top = qualified.split(".")[0]
+        if top not in STDLIB:
+            raise ImportError(f"non-stdlib import blocked: {qualified}")
+        return real_import(name, globals, locals, fromlist, level)
+
+    builtins.__import__ = guard
+    """
+)
+
+
+def _run_guard_subprocess(tmp_path, body, *, setup="", guarded=True):
     script = tmp_path / "stdlib_only.py"
     script.write_text(
-        textwrap.dedent(
-            """
-            import builtins
-            import sys
-
-            STDLIB = set(sys.stdlib_module_names) | {"hermes_cli"}
-            real_import = builtins.__import__
-
-            def guard(name, *args, **kwargs):
-                top = name.split(".")[0]
-                if top not in STDLIB:
-                    raise ImportError(f"non-stdlib import blocked: {name}")
-                return real_import(name, *args, **kwargs)
-
-            builtins.__import__ = guard
-            import hermes_cli._early_recovery  # noqa: F401
-            print("STDLIB_ONLY_OK")
-            """
-        ),
+        textwrap.dedent(setup) + (_STDLIB_GUARD if guarded else "")
+        + textwrap.dedent(body),
         encoding="utf-8",
     )
-    result = subprocess.run(
+    return subprocess.run(
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
@@ -135,7 +153,114 @@ def test_early_recovery_module_is_stdlib_only(tmp_path):
         env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
         timeout=60,
     )
+
+
+def test_early_recovery_module_is_stdlib_only(tmp_path):
+    """Recovery must load before any third-party dependency is available."""
+    result = _run_guard_subprocess(
+        tmp_path,
+        "import hermes_cli._early_recovery\nprint('STDLIB_ONLY_OK')\n",
+    )
+    assert result.returncode == 0, result.stderr
     assert "STDLIB_ONLY_OK" in result.stdout, result.stderr
+
+
+@pytest.mark.parametrize("body", [
+    "import math; assert math.sqrt(9) == 3",
+    """
+    import importlib
+    module = __import__("_bootstrap", {"__package__": "importlib"}, {},
+                        ("__import__",), 1)
+    assert module.__import__ is importlib.__import__
+    """,
+    """
+    module = __import__(name="", globals={"__package__": "email"},
+                        locals={}, fromlist=("errors",), level=1)
+    assert module.errors.MessageError.__module__ == "email.errors"
+    """,
+    """
+    module = __import__("errors", {"__package__": "email.mime"}, {},
+                        ("MessageError",), 2)
+    assert module.MessageError.__module__ == "email.errors"
+    """,
+    """
+    import email
+    module = __import__("errors", {"__spec__": email.__spec__}, {},
+                        ("MessageError",), 1)
+    assert module.MessageError.__module__ == "email.errors"
+    """,
+    """
+    module = __import__("base", {"__name__": "email.mime.text"}, {},
+                        ("MIMEBase",), 1)
+    assert module.MIMEBase.__module__ == "email.mime.base"
+    """,
+    """
+    import email
+    module = __import__("email.errors")
+    assert module is email
+    module = __import__("errors", {"__name__": "email", "__path__": []}, {},
+                        ("MessageError",), 1)
+    assert module.MessageError.__module__ == "email.errors"
+    """,
+    """
+    for namespace, level in [(None, 1), ({"__package__": ""}, 1),
+                             ({"__package__": "email"}, 2),
+                             ({"__package__": "email"}, -1)]:
+        try:
+            __import__("sys", namespace, {}, (), level)
+        except (ImportError, ValueError):
+            pass
+        else:
+            raise AssertionError("invalid relative import returned")
+    """,
+], ids=["absolute", "importlib-relative", "empty-keyword-fromlist", "parent-level",
+        "spec-fallback", "name-fallback", "package-return", "invalid-relative"])
+def test_stdlib_guard_preserves_import_semantics(tmp_path, body):
+    result = _run_guard_subprocess(
+        tmp_path, textwrap.dedent(body) + "\nprint('IMPORT_OK')\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "IMPORT_OK" in result.stdout, result.stderr
+
+
+@pytest.mark.parametrize("import_statement,setup", [
+    ("import guard_dependency.json", ""),
+    ("import _bootstrap", ""),
+    ('__import__("json", {"__package__": "guard_dependency"}, {}, ("VALUE",), 1)',
+     "import guard_dependency"),
+    ('__import__("sys", {"__package__": "guard_dependency"}, {}, ("VALUE",), 1)',
+     "import guard_dependency"),
+    ('__import__("", {"__package__": "guard_dependency"}, {}, ("json",), 1)',
+     "import guard_dependency"),
+    ("import guard_dependency.json", "import guard_dependency.json"),
+    ('__import__("json", {"__package__": "guard_dependency"}, {}, ("VALUE",), 1)',
+     "import guard_dependency.json"),
+    ('__import__("", {"__package__": "guard_dependency"}, {}, ("json",), 1)',
+     "import guard_dependency.json"),
+], ids=["absolute", "raw-bootstrap", "relative-json", "relative-sys", "empty",
+        "cached-absolute", "cached-relative", "cached-empty"])
+def test_stdlib_guard_rejects_discoverable_dependencies(tmp_path, import_statement, setup):
+    package = tmp_path / "guard_dependency"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "print('PACKAGE_EXECUTED')\n", encoding="utf-8",
+    )
+    for child in [package / "json.py", package / "sys.py", tmp_path / "_bootstrap.py"]:
+        child.write_text("VALUE = 42\nprint('DEPENDENCY_EXECUTED')\n", encoding="utf-8")
+    preamble = f"import sys\nsys.path.insert(0, {str(tmp_path)!r})\n" + setup + "\n"
+    body = import_statement + "\nprint('FORBIDDEN_IMPORT_RETURNED')\n"
+    unguarded = _run_guard_subprocess(tmp_path, body, setup=preamble, guarded=False)
+    assert unguarded.returncode == 0, unguarded.stderr
+    assert "DEPENDENCY_EXECUTED" in unguarded.stdout, unguarded.stderr
+    assert "FORBIDDEN_IMPORT_RETURNED" in unguarded.stdout
+    guarded = _run_guard_subprocess(
+        tmp_path, "print('GUARD_READY', flush=True)\n" + body, setup=preamble,
+    )
+    assert guarded.returncode != 0, guarded.stdout
+    assert "non-stdlib import blocked:" in guarded.stderr, guarded.stderr
+    after_guard = guarded.stdout.split("GUARD_READY\n", 1)[1]
+    assert "DEPENDENCY_EXECUTED" not in after_guard
+    assert "FORBIDDEN_IMPORT_RETURNED" not in guarded.stdout
 
 
 # ---------------------------------------------------------------------------

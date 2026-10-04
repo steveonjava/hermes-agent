@@ -1,6 +1,7 @@
 """Behavior tests for config-driven browser snapshot thresholds."""
 
 import json
+import os
 from unittest.mock import Mock
 
 import pytest
@@ -68,9 +69,13 @@ def test_invalid_values_fall_back_to_default(isolated_snapshot_threshold):
 
 def test_cleanup_reloads_updated_profile_config(isolated_snapshot_threshold):
     _write_threshold(isolated_snapshot_threshold, 12000)
+    config_path = isolated_snapshot_threshold / "config.yaml"
+    first_mtime = config_path.stat().st_mtime_ns
     assert browser_tool.get_browser_snapshot_threshold() == 12000
 
     _write_threshold(isolated_snapshot_threshold, 15001)
+    os.utime(config_path, ns=(first_mtime, first_mtime + 1_000_000_000))
+    assert config_path.stat().st_mtime_ns != first_mtime
     assert browser_tool.get_browser_snapshot_threshold() == 12000
 
     bt_lifecycle.cleanup_all_browsers()

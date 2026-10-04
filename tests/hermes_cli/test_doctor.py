@@ -258,7 +258,9 @@ class TestHonchoDoctorConfigDetection:
 
 
 
-def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
+@pytest.mark.parametrize("container", [False, True])
+def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path, container):
+    monkeypatch.setattr("hermes_constants.is_container", lambda: container)
     monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
     monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")
     monkeypatch.setenv("TERMINAL_CONTAINER_DISK", "2048")
@@ -278,6 +280,11 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
         doctor_mod.run_doctor(Namespace(fix=False))
 
     out = buf.getvalue()
+    assert "super-secret-value" not in out
+    if container:
+        assert "using local terminal backend" in out
+        assert "Vercel runtime" not in out
+        return
     assert "Vercel runtime" in out
     assert "python3.13" in out
     assert "Vercel custom disk unsupported" in out

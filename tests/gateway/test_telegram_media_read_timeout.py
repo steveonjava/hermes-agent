@@ -24,9 +24,20 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    import socket
+    import tools.url_safety as url_safety
+
+    def resolve(host, port=None):
+        if host != "example.com":
+            raise socket.gaierror(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                 ("93.184.216.34", port or 443))]
+
+    monkeypatch.setattr(url_safety, "_getaddrinfo", resolve)
     a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
     a._bot = MagicMock()
+    a._bot.send_message = AsyncMock(return_value=MagicMock(message_id=3))
     a._metadata_thread_id = lambda metadata: None
     a._thread_kwargs_for_send = lambda *args, **kwargs: {}
     a._notification_kwargs = lambda metadata: {}
@@ -78,6 +89,8 @@ async def test_send_image_url_path_uses_media_read_timeout(adapter):
     result = await adapter.send_image("123", "https://example.com/pic.png", caption="hi")
 
     assert result.success
+    adapter._bot.send_photo.assert_awaited_once()
+    assert calls[0]["photo"] == "https://example.com/pic.png"
     assert calls[0]["read_timeout"] == tg._MEDIA_SEND_READ_TIMEOUT
 
 
@@ -101,6 +114,16 @@ async def test_send_image_upload_fallback_uses_media_read_timeout(adapter, monke
 
     assert result.success
     assert len(calls) == 2, "expected the byte-upload fallback to run"
+    assert adapter._bot.send_photo.await_count == 2
+    assert calls[0]["read_timeout"] == tg._MEDIA_SEND_READ_TIMEOUT
     upload = calls[1]
     assert isinstance(upload["photo"], (bytes, bytearray))
+    assert len(upload["photo"]) == 8 * 1024 * 1024
     assert upload["read_timeout"] == tg._MEDIA_SEND_READ_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_blocked_image_url_never_reaches_photo_api(adapter):
+    adapter._bot.send_photo = AsyncMock()
+    await adapter.send_image("123", "http://169.254.169.254/image.png")
+    adapter._bot.send_photo.assert_not_awaited()

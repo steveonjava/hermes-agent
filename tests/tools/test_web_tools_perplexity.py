@@ -48,10 +48,20 @@ def test_search_dispatch_maps_search_api_shape():
     }
 
 
-def test_extract_dispatch_snippets_per_url_and_missing_key():
+def test_extract_dispatch_snippets_per_url_and_missing_key(monkeypatch):
     """web_extract on backend=perplexity posts every URL to /sdk/content/snippets;
     a URL the backend failed carries ``error`` instead of content; no key → error, no HTTP."""
     import tools.web_tools as wt
+    import socket
+    import tools.url_safety as url_safety
+
+    def resolve(host, port=None):
+        if host not in {"tokio.rs", "docs.rs"}:
+            raise socket.gaierror(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                 ("93.184.216.34", port or 443))]
+
+    monkeypatch.setattr(url_safety, "_getaddrinfo", resolve)
 
     register_all_web_providers()
     urls = ["https://tokio.rs/tokio/tutorial", "https://docs.rs/smol"]
@@ -84,3 +94,20 @@ def test_extract_dispatch_snippets_per_url_and_missing_key():
         docs = p.extract(["https://example.com"])
         assert "PERPLEXITY_API_KEY" in docs[0]["error"]
         post.assert_not_called()
+
+
+def test_extract_private_url_never_reaches_provider(monkeypatch):
+    import socket
+    import tools.url_safety as url_safety
+    import tools.web_tools as wt
+
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lambda host, port=None: [
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("10.0.0.1", port or 443))
+    ])
+    register_all_web_providers()
+    with patch.dict(os.environ, {"PERPLEXITY_API_KEY": "fixture"}), \
+         patch.object(wt, "_get_extract_backend", return_value="perplexity"), \
+         patch("plugins.web.perplexity.provider.httpx.post") as post:
+        result = json.loads(asyncio.run(wt.web_extract_tool(["https://internal.example.test/private"])))
+    post.assert_not_called()
+    assert result["results"][0]["error"]

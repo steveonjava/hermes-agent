@@ -20,6 +20,35 @@ from tools import browser_tool_session as bt_session
 from tools import browser_tool_install as bt_install
 
 
+@pytest.fixture
+def owner_only_snapshot(monkeypatch):
+    import hermes_cli.config as config
+
+    monkeypatch.setattr(config, "_is_container", lambda: False)
+    monkeypatch.setattr(config, "is_managed", lambda: False)
+    monkeypatch.delenv("HERMES_HOME_MODE", raising=False)
+
+
+@pytest.mark.parametrize("container,managed", [(True, False), (False, True)])
+def test_snapshot_hardening_preserves_container_managed_modes(tmp_path, monkeypatch, container, managed):
+    import hermes_cli.config as config
+    import hermes_cli.browser_connect as bc
+
+    monkeypatch.setattr(config, "_is_container", lambda: container)
+    monkeypatch.setattr(config, "is_managed", lambda: managed)
+    directory = tmp_path / "snapshot"
+    directory.mkdir(mode=0o755)
+    cookies = directory / "Cookies"
+    cookies.write_bytes(b"synthetic credential fixture")
+    cookies.chmod(0o644)
+    before = cookies.stat().st_mode
+    chmod = Mock(wraps=os.chmod)
+    monkeypatch.setattr(os, "chmod", chmod)
+    bc._secure_snapshot(str(directory), contents=True)
+    assert cookies.stat().st_mode == before
+    chmod.assert_not_called()
+
+
 def _auth_db(path, value=None):
     """Store/read a marker in a real auth DB so snapshot fixtures exercise SQLite."""
     import sqlite3
@@ -158,7 +187,7 @@ class TestSnapshotRealProfile:
         assert dst is None
         assert err and "was not found" in err
 
-    def test_snapshot_files_are_owner_only(self, tmp_path, monkeypatch):
+    def test_snapshot_files_are_owner_only(self, tmp_path, monkeypatch, owner_only_snapshot):
         """Every copied file must be 0600 and every dir 0700 (#96729).
 
         copy2 preserves Chrome's 0644 source modes and sqlite-backup files
@@ -189,7 +218,7 @@ class TestSnapshotRealProfile:
                     offenders.append((os.path.join(root, f), oct(mode)))
         assert not offenders, f"group/world-accessible snapshot entries: {offenders}"
 
-    def test_existing_lax_snapshot_heals_on_refresh(self, tmp_path, monkeypatch):
+    def test_existing_lax_snapshot_heals_on_refresh(self, tmp_path, monkeypatch, owner_only_snapshot):
         """A snapshot left 0644 by an older build tightens on the next pass."""
         import stat
 
@@ -1006,6 +1035,13 @@ class TestReviewRound3:
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
         proc = Mock(returncode=0, stdout="", stderr="")
+        launches = []
+
+        def fake_popen(argv, **kwargs):
+            launches.append(argv)
+            (tmp_path / "DevToolsActivePort").write_text("9251\n/devtools/browser/fixture\n", encoding="utf-8")
+            return Mock(poll=Mock(return_value=None))
+
         with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
              patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
@@ -1015,11 +1051,17 @@ class TestReviewRound3:
              patch.object(bt_real_profile, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/fixture/chrome"), \
+             patch.object(bt_real_profile, "_surviving_chrome_cdp", return_value=None), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
              patch.object(bt.subprocess, "run", return_value=proc), \
              patch.object(bt_cloud, "_is_headed_mode", return_value=False):
             cdp, err = bt_real_profile._real_profile_cdp()
         assert err is None
         snap.assert_called_once()
+        assert cdp == "http://127.0.0.1:9251"
+        assert len(launches) == 1
+        assert f"--user-data-dir={tmp_path}" in launches[0]
         bt._real_profile_cdp_cache.clear()
 
 

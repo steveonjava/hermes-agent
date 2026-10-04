@@ -385,6 +385,59 @@ class TestSlackAttachmentDiagnostics:
 # SlackAdapter._download_slack_file
 # ---------------------------------------------------------------------------
 
+@pytest.fixture
+def slack_public_dns(monkeypatch):
+    import socket
+    import tools.url_safety as url_safety
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "false")
+    monkeypatch.setattr(url_safety, "_allow_private_resolved", False)
+    addresses = {
+        "files.slack.com": "93.184.216.34",
+        "public.example.test": "93.184.216.34",
+        "second.example.test": "93.184.216.35",
+        "files.slack.com.evil.test": "93.184.216.36",
+        "internal.example.test": "10.0.0.1",
+        "10.0.0.1": "10.0.0.1",
+    }
+    answers = []
+
+    def resolve(host, port=None):
+        if host not in addresses:
+            raise socket.gaierror(host)
+        answer = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                   (addresses[host], port or 443))]
+        answers.append((host, answer))
+        return answer
+
+    monkeypatch.setattr(url_safety, "_getaddrinfo", resolve)
+    return addresses, answers
+
+
+@pytest.fixture
+def slack_http(monkeypatch, slack_public_dns):
+    import httpx
+
+    requests = []
+    client_class = httpx.AsyncClient
+
+    def install(handler):
+        class Transport(httpx.AsyncHTTPTransport):
+            async def handle_async_request(self, request):
+                requests.append(request)
+                return handler(request)
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client_class(
+            transport=Transport(), **kw
+        ))
+        return requests
+
+    return install
+
+
+@pytest.mark.usefixtures("slack_public_dns")
 class TestSlackDownloadSlackFile:
     """Tests for SlackAdapter._download_slack_file"""
 
@@ -411,6 +464,8 @@ class TestSlackDownloadSlackFile:
 
         path = asyncio.run(run())
         assert path.endswith(".jpg")
+        from pathlib import Path
+        assert Path(path).read_bytes() == fake_response.content
         mock_client.get.assert_called_once()
 
     def test_rejects_html_response(self, tmp_path, monkeypatch):
@@ -447,6 +502,7 @@ class TestSlackDownloadSlackFile:
 # SlackAdapter._download_slack_file_bytes
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("slack_public_dns")
 class TestSlackDownloadSlackFileBytes:
     """Tests for SlackAdapter._download_slack_file_bytes"""
 
@@ -472,6 +528,135 @@ class TestSlackDownloadSlackFileBytes:
 
         result = asyncio.run(run())
         assert result == b"raw bytes here"
+
+    def test_public_cross_origin_redirects_omit_bearer(self, slack_http):
+        import httpx
+
+        targets = {
+            "files.slack.com": "https://public.example.test/first",
+            "public.example.test": "https://second.example.test/last",
+        }
+
+        def respond(request):
+            target = targets.get(request.url.host)
+            if target:
+                return httpx.Response(302, headers={"location": target})
+            return httpx.Response(200, content=b"redirected file")
+
+        requests = slack_http(respond)
+        adapter = _make_slack_adapter()
+        adapter.config.token = "fixture"
+        assert asyncio.run(adapter._download_slack_file_bytes(
+            "https://files.slack.com/file.bin"
+        )) == b"redirected file"
+        assert [r.url.host for r in requests] == [
+            "files.slack.com", "public.example.test", "second.example.test",
+        ]
+        assert requests[0].headers["authorization"] == "Bearer fixture"
+        assert all("authorization" not in r.headers for r in requests[1:])
+
+    def test_retry_preserves_timeout_and_content(self, monkeypatch, slack_http):
+        import httpx
+
+        attempts = []
+
+        def respond(request):
+            attempts.append(request)
+            if len(attempts) == 1:
+                return httpx.Response(429)
+            return httpx.Response(200, content=b"retried file")
+
+        requests = slack_http(respond)
+        sleep = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep)
+        assert asyncio.run(_make_slack_adapter()._download_slack_file_bytes(
+            "https://files.slack.com/retry"
+        )) == b"retried file"
+        assert len(requests) == 2
+        assert all(r.extensions["timeout"]["read"] == 30.0 for r in requests)
+        sleep.assert_awaited_once_with(1.5)
+
+    @pytest.mark.parametrize("target", [
+        "https://10.0.0.1/private", "https://internal.example.test/private",
+    ])
+    def test_redirect_rejects_private_resolved_target(self, slack_http, slack_public_dns, target):
+        import httpx
+        from urllib.parse import urlparse
+
+        requests = slack_http(lambda request: httpx.Response(
+            302, headers={"location": target}
+        ) if request.url.host == "files.slack.com" else httpx.Response(200, content=b"unsafe"))
+        adapter = _make_slack_adapter()
+        adapter.config.token = "fixture"
+        with pytest.raises(ValueError, match="Blocked"):
+            asyncio.run(adapter._download_slack_file_bytes("https://files.slack.com/file.bin"))
+        assert len(requests) == 1
+        assert requests[0].headers["authorization"] == "Bearer fixture"
+        assert any(host == urlparse(target).hostname and answer[0][4][0] == "10.0.0.1"
+                   for host, answer in slack_public_dns[1])
+
+    @pytest.mark.parametrize("url", [
+        "https://public.example.test/non-slack",
+        "https://files.slack.com.evil.test/lookalike",
+        "http://files.slack.com/plain",
+    ])
+    def test_rejected_initial_url_never_sends_token(self, slack_http, url):
+        import httpx
+
+        requests = slack_http(lambda request: httpx.Response(200, content=b"unsafe"))
+        adapter = _make_slack_adapter()
+        with pytest.raises(ValueError, match="Blocked"):
+            asyncio.run(adapter._download_slack_file_bytes(url))
+        assert requests == []
+
+    def test_private_slack_dns_answer_is_rejected(self, slack_http, slack_public_dns):
+        import httpx
+
+        slack_public_dns[0]["files.slack.com"] = "10.0.0.1"
+        requests = slack_http(lambda request: httpx.Response(200, content=b"unsafe"))
+        with pytest.raises(ValueError, match="Blocked"):
+            asyncio.run(_make_slack_adapter()._download_slack_file_bytes(
+                "https://files.slack.com/private"
+            ))
+        assert requests == []
+        assert slack_public_dns[1][0][1][0][4][0] == "10.0.0.1"
+
+    def test_unresolved_slack_dns_is_rejected(self, slack_http, slack_public_dns):
+        import httpx
+
+        del slack_public_dns[0]["files.slack.com"]
+        requests = slack_http(lambda request: httpx.Response(200, content=b"unsafe"))
+        with pytest.raises(ValueError, match="Blocked"):
+            asyncio.run(_make_slack_adapter()._download_slack_file_bytes(
+                "https://files.slack.com/unresolved"
+            ))
+        assert requests == []
+        assert slack_public_dns[1] == []
+
+    def test_dns_rebinding_is_rejected_before_tcp_connect(self, monkeypatch, slack_public_dns):
+        import socket
+        import tools.url_safety as url_safety
+        from httpcore._backends.auto import AutoBackend
+
+        answers = []
+        connects = AsyncMock(side_effect=AssertionError("unsafe TCP connect attempted"))
+
+        def resolve(host, port=None):
+            ip = "93.184.216.34" if port is None else "10.0.0.1"
+            answers.append((host, port, ip))
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, port or 443))]
+
+        monkeypatch.setattr(url_safety, "_getaddrinfo", resolve)
+        monkeypatch.setattr(AutoBackend, "connect_tcp", connects)
+        with pytest.raises(url_safety.SSRFConnectionBlocked, match="during connect"):
+            asyncio.run(_make_slack_adapter()._download_slack_file_bytes(
+                "https://files.slack.com/rebound"
+            ))
+        assert answers == [
+            ("files.slack.com", None, "93.184.216.34"),
+            ("files.slack.com", 443, "10.0.0.1"),
+        ]
+        connects.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

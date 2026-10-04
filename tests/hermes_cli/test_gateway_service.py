@@ -777,13 +777,18 @@ class TestGatewayServiceDetection:
 
         assert gateway_cli.supports_systemd_services() is False
 
-    def test_supports_systemd_services_returns_true_when_systemctl_present(self, monkeypatch):
+    @pytest.mark.parametrize("container,operational,expected", [
+        (False, False, True), (True, False, False), (True, True, True),
+    ])
+    def test_supports_systemd_services_checks_environment(self, monkeypatch, container, operational, expected):
+        monkeypatch.setattr(gateway_cli, "is_container", lambda: container)
+        monkeypatch.setattr(gateway_cli, "_systemd_operational", lambda system=False: operational)
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/usr/bin/systemctl")
 
-        assert gateway_cli.supports_systemd_services() is True
+        assert gateway_cli.supports_systemd_services() is expected
 
     def test_is_service_running_checks_system_scope_when_user_scope_is_inactive(self, monkeypatch):
         user_unit = SimpleNamespace(exists=lambda: True)

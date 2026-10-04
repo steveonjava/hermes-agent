@@ -1,11 +1,11 @@
-"""Native OpenAI Responses server-side compaction — gpt-5.6 on direct OpenAI routes only.
+"""Native OpenAI Responses compaction on direct or explicitly approved routes.
 
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` makes the server
 summarize older context into an opaque ``compaction`` item once the input crosses N tokens.
-Deliberately narrow (live-verified): gpt-5.6 only (5.1/5.2 fail server-side with no
-structured rejection) on api.openai.com or the ChatGPT Codex backend. The local compressor
-stays armed as fallback (native threshold clamped below the local trigger); compaction items
-ride the ``codex_reasoning_items`` sidecar. No transport imports (shared gate, no cycles).
+The model gate allows GPT-5.6 and GPT-6* on direct OpenAI/Codex or explicitly approved
+Responses routes (5.1/5.2 remain unsupported). Family eligibility is not live route verification.
+The local compressor stays armed as fallback (native threshold clamped below the local trigger).
+Compaction items ride the ``codex_reasoning_items`` sidecar. No transport imports (shared gate, no cycles).
 """
 
 from __future__ import annotations
@@ -28,8 +28,9 @@ _ELIGIBLE_MODEL_MARKER = "gpt-5.6"
 
 
 def is_native_compaction_model(model: Optional[str]) -> bool:
-    """True when the model is in the gpt-5.6 family."""
-    return _ELIGIBLE_MODEL_MARKER in (model or "").lower()
+    """Allow GPT-5.6 and GPT-6*; route approval is a separate gate."""
+    normalized = (model or "").strip().lower()
+    return _ELIGIBLE_MODEL_MARKER in normalized or normalized.rsplit("/", 1)[-1].startswith("gpt-6")
 
 
 def resolve_native_compaction_capabilities(
@@ -121,9 +122,9 @@ def native_compaction_context_management(agent: Any, *, is_codex_backend: bool, 
     if getattr(agent, "compression_checkpoint_required", False) is True:
         _warn_native_compaction_suppressed_by_checkpoint_gate()
         return None
+    trusted_proxy = getattr(agent, "capabilities", {}).get("openai_native_compaction") is True
     if is_xai_responses or is_github_responses or not is_native_compaction_model(getattr(agent, "model", None)):
         return None
-    trusted_proxy = getattr(agent, "capabilities", {}).get("openai_native_compaction") is True
     if not trusted_proxy and not is_direct_openai_route(getattr(agent, "base_url", None), is_codex_backend=is_codex_backend):
         return None
 

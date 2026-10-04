@@ -110,7 +110,7 @@ class TestRelaunch:
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: "/usr/bin/hermes")
 
         with pytest.raises(SystemExit):
-            relaunch_mod.relaunch(["--resume", "abc"])
+            relaunch_mod.relaunch(["--resume", "abc"], original_argv=[])
 
         assert calls == [("/usr/bin/hermes", ["/usr/bin/hermes", "--resume", "abc"])]
 
