@@ -174,7 +174,7 @@ compression:
   codex_gpt55_autoraise: true  # gpt-5.5 on Codex OAuth: raise trigger to 85% (default: true)
   codex_gpt55_autoraise_notice: true  # Show the one-time autoraise notice (default: true)
   codex_app_server_auto: native  # native|hermes|off for Codex app-server thread compaction
-  codex_responses_native: false  # gpt-5.6 on direct OpenAI/Codex: server-side compaction (opt-in)
+  codex_responses_native: false  # GPT-5.6 and later on approved Responses routes (opt-in)
   codex_responses_compact_threshold: null  # Automatic server compaction trigger
   in_place: true             # Compact on the same session id, no rotation (default: true)
 
@@ -201,7 +201,7 @@ auxiliary:
 | `codex_gpt55_autoraise` | `true` | bool | Raise the trigger to 85% for gpt-5.4/5.5/5.6 and gpt-6 Astra on the ChatGPT Codex OAuth route (see below). Set `false` to keep the global `threshold` |
 | `codex_gpt55_autoraise_notice` | `true` | bool | Show the one-time Codex gpt-5.5 autoraise notice. Set `false` to keep the 85% autoraise but suppress the banner |
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
-| `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Allows GPT-5.6 and GPT-6* on direct OpenAI/Codex or explicitly approved Responses routes (see below) |
+| `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Allows GPT families with numeric version >= (5, 6) on direct OpenAI/Codex or explicitly approved Responses routes (see below) |
 | `codex_responses_compact_threshold` | `null` | `null` or positive integer | `null` follows the resolved local compression trigger with an 8,192 token safety margin. A positive integer remains absolute and only clamps downward when required. Invalid values use automatic behavior. Automatic mode falls back to `200000` when no usable local trigger exists |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
 
@@ -344,10 +344,16 @@ client-side summary pass, and ZDR-friendly (`store: false`, no
 Opt in with `compression.codex_responses_native: true`. The gate is deliberately
 narrow, re-checked on every request:
 
-- **Models:** the gpt-5.6 family and any model whose normalized model portion
-  starts with `gpt-6`, including versioned names, future variants and subscription
-  aliases. The gate strips surrounding whitespace, ignores case and checks the
-  final component of vendor-qualified names such as `openai/gpt-6.1-sol`.
+- **Models:** GPT-5.6 and any GPT family whose parsed numeric `(major, minor)`
+  version is at least `(5, 6)`, including future unreleased families. The gate
+  strips surrounding whitespace, ignores case and parses the leading
+  `gpt-<major>[.<minor>]` in the final component of vendor-qualified names such
+  as `openai/gpt-6.1-sol`. An omitted minor version defaults to zero; suffixes
+  do not affect the version. For example, `gpt-5.10`, `gpt-7` and
+  `gpt-8.2-future` qualify. Names without a leading numeric GPT version fail closed.
+  We assume new OpenAI families above this threshold are compatible until
+  demonstrated otherwise. A genuine incompatibility would need a follow-up
+  exclusion, rather than a new inclusion change for each model release.
   Legacy gpt-5.1/5.2 remain excluded: they return HTTP 500 or stall the stream
   without a structured rejection (verified live Aug 2026).
 - **Routes:** `api.openai.com` (OpenAI API key) or the ChatGPT Codex backend
@@ -358,7 +364,7 @@ narrow, re-checked on every request:
 
 Approve only a route that passes actual checkpoint issuance and encrypted-item
 replay, including a tool turn and disposable-session resume. An HTTP 200 on a
-tiny request is not evidence that a relay supports compaction. GPT-6* model
+tiny request is not evidence that a relay supports compaction. Model-family
 eligibility does not mean every variant or remote route has been live-tested.
 For example:
 

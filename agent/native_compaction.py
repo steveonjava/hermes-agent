@@ -2,7 +2,7 @@
 
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` makes the server
 summarize older context into an opaque ``compaction`` item once the input crosses N tokens.
-The model gate allows GPT-5.6 and GPT-6* on direct OpenAI/Codex or explicitly approved
+The model gate allows numeric GPT versions >= (5, 6) on direct OpenAI/Codex or explicitly approved
 Responses routes (5.1/5.2 remain unsupported). Family eligibility is not live route verification.
 The local compressor stays armed as fallback (native threshold clamped below the local trigger).
 Compaction items ride the ``codex_reasoning_items`` sidecar. No transport imports (shared gate, no cycles).
@@ -11,6 +11,7 @@ Compaction items ride the ``codex_reasoning_items`` sidecar. No transport import
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -23,14 +24,15 @@ logger = logging.getLogger(__name__)
 LOCAL_TRIGGER_SAFETY_MARGIN = 8_192
 # Fallback when automatic mode has no local trigger to follow.
 DEFAULT_COMPACT_THRESHOLD = 200_000
-# Substring match so dated snapshots and variants (gpt-5.6-mini) stay eligible.
-_ELIGIBLE_MODEL_MARKER = "gpt-5.6"
 
 
 def is_native_compaction_model(model: Optional[str]) -> bool:
-    """Allow GPT-5.6 and GPT-6*; route approval is a separate gate."""
-    normalized = (model or "").strip().lower()
-    return _ELIGIBLE_MODEL_MARKER in normalized or normalized.rsplit("/", 1)[-1].startswith("gpt-6")
+    """Allow GPT families at numeric version (5, 6) or later; routes need separate approval."""
+    normalized = (model or "").strip().lower().rsplit("/", 1)[-1]
+    version = re.match(r"^gpt-(\d+)(?:\.(\d+))?", normalized)
+    if version is None:
+        return False
+    return (int(version.group(1)), int(version.group(2) or 0)) >= (5, 6)
 
 
 def resolve_native_compaction_capabilities(
