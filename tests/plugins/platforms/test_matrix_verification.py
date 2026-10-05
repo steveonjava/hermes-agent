@@ -369,13 +369,25 @@ class TestStateMachineSafety:
         }
         assert asyncio.run(h._verify_user_macs(session, content)) is False
 
-    def test_send_our_mac_does_not_advance_on_transport_failure(self):
+    @pytest.mark.parametrize("chosen_mac", ["hkdf-hmac-sha256", "hkdf-hmac-sha256.v2"])
+    def test_send_our_mac_does_not_advance_on_transport_failure(
+        self, monkeypatch, chosen_mac
+    ):
+        import sys
+
         h = _make_handler()
         session = _make_session()
+        mac_calls = []
+        sends = []
 
         class FakeMac:
+            def calculate_mac(self, value, info):
+                mac_calls.append(("v1", value, info))
+                return f"v1:{value}:{info}"
+
             def calculate_mac_fixed_base64(self, value, info):
-                return f"mac:{value}:{info}"
+                mac_calls.append(("v2", value, info))
+                return f"v2:{value}:{info}"
 
         class Account:
             identity_keys = {"ed25519": "BOTKEY"}
@@ -386,16 +398,102 @@ class TestStateMachineSafety:
             async def get_own_cross_signing_public_keys(self):
                 return None
 
-        async def failed_send(*args, **kwargs):
+        async def failed_send(event_type, sent_session, payload):
+            assert session.mac_sent is False
+            sends.append((event_type, sent_session, payload))
             return False
 
         session.sas = FakeMac()
-        session.chosen_mac = "hkdf-hmac-sha256.v2"
+        session.chosen_mac = chosen_mac
         h._olm = Olm()
         h._send = failed_send
 
-        asyncio.run(h._send_our_mac(session))
+        missing = object()
+        previous = sys.modules.get("olm", missing)
+        with monkeypatch.context() as optional_import:
+            optional_import.setitem(sys.modules, "olm", types.ModuleType("olm"))
+            asyncio.run(h._send_our_mac(session))
+        assert sys.modules.get("olm", missing) is previous
         assert session.mac_sent is False
+
+        method = "v2" if chosen_mac == "hkdf-hmac-sha256.v2" else "v1"
+        info = "MATRIX_KEY_VERIFICATION_MAC@bot:example.orgBOTDEV@alice:example.orgALICEDEVt-1"
+        assert mac_calls == [
+            (method, "BOTKEY", info + "ed25519:BOTDEV"),
+            (method, "ed25519:BOTDEV", info + "KEY_IDS"),
+        ]
+        assert len(sends) == 1
+        event_type, sent_session, payload = sends[0]
+        assert event_type == "m.key.verification.mac"
+        assert sent_session is session
+        assert payload == {
+            "transaction_id": "t-1",
+            "mac": {"ed25519:BOTDEV": f"{method}:BOTKEY:{info}ed25519:BOTDEV"},
+            "keys": f"{method}:ed25519:BOTDEV:{info}KEY_IDS",
+        }
+
+    @pytest.mark.parametrize("chosen_mac", ["hkdf-hmac-sha256", "hkdf-hmac-sha256.v2"])
+    def test_send_our_mac_advances_after_successful_transport(
+        self, monkeypatch, chosen_mac
+    ):
+        import sys
+
+        h = _make_handler()
+        session = _make_session()
+        mac_calls = []
+        sends = []
+
+        class FakeMac:
+            def calculate_mac(self, value, info):
+                mac_calls.append(("v1", value, info))
+                return f"v1:{value}:{info}"
+
+            def calculate_mac_fixed_base64(self, value, info):
+                mac_calls.append(("v2", value, info))
+                return f"v2:{value}:{info}"
+
+        class Account:
+            identity_keys = {"ed25519": "BOTKEY"}
+
+        class Olm:
+            account = Account()
+
+            async def get_own_cross_signing_public_keys(self):
+                return None
+
+        async def successful_send(event_type, sent_session, payload):
+            assert session.mac_sent is False
+            sends.append((event_type, sent_session, payload))
+            return True
+
+        session.sas = FakeMac()
+        session.chosen_mac = chosen_mac
+        h._olm = Olm()
+        h._send = successful_send
+
+        missing = object()
+        previous = sys.modules.get("olm", missing)
+        with monkeypatch.context() as optional_import:
+            optional_import.setitem(sys.modules, "olm", types.ModuleType("olm"))
+            asyncio.run(h._send_our_mac(session))
+        assert sys.modules.get("olm", missing) is previous
+        assert session.mac_sent is True
+
+        method = "v2" if chosen_mac == "hkdf-hmac-sha256.v2" else "v1"
+        info = "MATRIX_KEY_VERIFICATION_MAC@bot:example.orgBOTDEV@alice:example.orgALICEDEVt-1"
+        assert mac_calls == [
+            (method, "BOTKEY", info + "ed25519:BOTDEV"),
+            (method, "ed25519:BOTDEV", info + "KEY_IDS"),
+        ]
+        assert len(sends) == 1
+        event_type, sent_session, payload = sends[0]
+        assert event_type == "m.key.verification.mac"
+        assert sent_session is session
+        assert payload == {
+            "transaction_id": "t-1",
+            "mac": {"ed25519:BOTDEV": f"{method}:BOTKEY:{info}ed25519:BOTDEV"},
+            "keys": f"{method}:ed25519:BOTDEV:{info}KEY_IDS",
+        }
 
     @staticmethod
     def _event_for(session):
