@@ -264,10 +264,16 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
         settled one goes instead, even if the busy one is older."""
         import threading
 
+        from tools.code_kernel_remote import _REGISTRY
+
         gate = threading.Event()
+        ready = threading.Event()
+        worker_errors = []
 
         def slow_cat(command):
-            gate.wait(10)
+            # Result polling starts after the kernel's attached count rises.
+            ready.set()
+            self.assertTrue(gate.wait(10), "busy cell release timed out")
             return {"output": json.dumps(_cell()), "returncode": 0}
 
         busy_env = ScriptedEnv([
@@ -275,17 +281,45 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
             ("kill -0", lambda c: {"output": "ALIVE\n", "returncode": 0}),
             ("cat ", slow_cat),
         ])
+
+        def run_busy_cell():
+            try:
+                result = _run(busy_env, task="busy")
+                self.assertEqual(result["status"], "success", result)
+            except BaseException as exc:
+                worker_errors.append(exc)
+
         with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)):
-            worker = threading.Thread(target=_run, args=(busy_env,), kwargs={"task": "busy"})
+            worker = threading.Thread(target=run_busy_cell)
             worker.start()
-            while not any(k.attached for k in _REMOTE_KERNELS.values()):
-                pass
-            env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
-            _run(env, task="settled")
-            owners = {key[0] for key in _REMOTE_KERNELS}
-            self.assertIn("busy", owners)
-            gate.set()
-            worker.join(10)
+            try:
+                self.assertTrue(
+                    ready.wait(10), "busy cell never reached result polling"
+                )
+                self.assertTrue(any("/cells/cell_res_" in c for c in busy_env.commands))
+                with _REGISTRY.lock:
+                    busy_kernel = next(
+                        k for k in _REMOTE_KERNELS.values() if k.env is busy_env
+                    )
+                    self.assertEqual(busy_kernel.attached, 1)
+                self.assertTrue(worker.is_alive())
+                self.assertFalse(gate.is_set())
+                env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+                result = _run(env, task="settled")
+                self.assertEqual(result["status"], "success", result)
+                owners = {key[0] for key in _REMOTE_KERNELS}
+                self.assertIn("busy", owners)
+                self.assertTrue(worker.is_alive())
+                self.assertFalse(gate.is_set())
+            finally:
+                gate.set()
+                worker.join(10)
+                self.assertFalse(
+                    worker.is_alive(), "busy cell worker did not terminate"
+                )
+                if worker_errors:
+                    worker_error = worker_errors[0]
+                    raise AssertionError("busy cell worker failed") from worker_error
         self.assertFalse(any("kill 4242" in c for c in busy_env.commands))
 
 
