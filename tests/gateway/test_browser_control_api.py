@@ -53,6 +53,17 @@ def _ticket_protocol(ticket):
     return f"hermes-browser-control-ticket.{ticket}"
 
 
+async def _wait_for_controller_ready(ws, nonce):
+    await ws.send_json({
+        "method": "browser.controller.heartbeat",
+        "params": {"nonce": nonce},
+    })
+    heartbeat = await ws.receive_json(timeout=2.0)
+    assert heartbeat["method"] == "browser.controller.heartbeat"
+    assert heartbeat["params"]["nonce"] == nonce
+    assert heartbeat["params"]["ok"] is True
+
+
 def _adapter(*, key=API_KEY):
     adapter = APIServerAdapter(
         PlatformConfig(enabled=True, extra={"key": key} if key else {})
@@ -498,6 +509,7 @@ async def test_real_browser_action_routes_through_controller_without_legacy_fall
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(registration["ticket"])],
         )
 
+        await _wait_for_controller_ready(ws, "heartbeat-action-fixture")
         legacy_calls = []
         pending = asyncio.create_task(
             asyncio.to_thread(
@@ -555,6 +567,7 @@ async def test_local_api_same_identity_reconnect_completes_command_started_on_ol
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(first["ticket"])],
         )
 
+        await _wait_for_controller_ready(first_ws, "heartbeat-reconnect-first-fixture")
         pending = asyncio.create_task(
             asyncio.to_thread(
                 route_browser_tool,
@@ -613,6 +626,7 @@ async def test_local_api_explicit_detach_is_hard_and_stale_socket_cannot_detach_
             "/v1/browser-control/ws",
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(first["ticket"])],
         )
+        await _wait_for_controller_ready(first_ws, "heartbeat-detach-first-fixture")
         second_response = await client.post(
             "/v1/browser-control/register",
             json=_registration_body(capabilities=["controller.noop"]),
@@ -624,6 +638,7 @@ async def test_local_api_explicit_detach_is_hard_and_stale_socket_cannot_detach_
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(second["ticket"])],
         )
 
+        await _wait_for_controller_ready(second_ws, "heartbeat-detach-second-fixture")
         await first_ws.send_json(
             {"method": "browser.controller.detach", "params": {}}
         )
@@ -685,6 +700,7 @@ async def test_remote_api_uses_the_same_authenticated_noop_round_trip(monkeypatc
             "/v1/browser-control/ws",
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(registration["ticket"])],
         )
+        await _wait_for_controller_ready(ws, "heartbeat-remote-fixture")
         scope = ControllerScope(
             principal_id=registration["scope"]["principal_id"],
             profile_id=registration["scope"]["profile_id"],
@@ -718,3 +734,90 @@ async def test_remote_api_uses_the_same_authenticated_noop_round_trip(monkeypatc
             "family": "remote-api"
         }
         await ws.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption", ["method", "nonce", "false-ok", "nonboolean-ok", "missing-ack"]
+)
+async def test_controller_readiness_rejects_corrupted_real_acknowledgment(
+    monkeypatch, corruption
+):
+    adapter = _adapter()
+    monkeypatch.setattr(adapter, "_browser_control_enabled", lambda: True)
+    real_frame = adapter._handle_browser_control_frame
+    observed = []
+
+    def corrupt_ack(scope, frame, **kwargs):
+        reply = real_frame(scope, frame, **kwargs)
+        if (
+            isinstance(reply, dict)
+            and reply["method"] == "browser.controller.heartbeat"
+        ):
+            observed.append(reply["params"].copy())
+            # Corrupt the real reply only in this negative control.
+            if corruption == "missing-ack":
+                return None
+            field, value = {
+                "method": ("method", "browser.controller.detach"),
+                "nonce": ("nonce", "unrelated-fixture-nonce"),
+                "false-ok": ("ok", False),
+                "nonboolean-ok": ("ok", 1),
+            }[corruption]
+            target = reply if field == "method" else reply["params"]
+            target[field] = value
+        return reply
+
+    monkeypatch.setattr(adapter, "_handle_browser_control_frame", corrupt_ack)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/v1/browser-control/register",
+            json=_registration_body(),
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+        assert response.status == 201
+        registration = await response.json()
+        ws = await client.ws_connect(
+            "/v1/browser-control/ws",
+            protocols=[CONTROL_PROTOCOL, _ticket_protocol(registration["ticket"])],
+        )
+        expected = (
+            asyncio.TimeoutError if corruption == "missing-ack" else AssertionError
+        )
+        with pytest.raises(expected):
+            await _wait_for_controller_ready(ws, "heartbeat-corruption-fixture")
+        assert observed == [{"nonce": "heartbeat-corruption-fixture", "ok": True}]
+        assert adapter._browser_control_broker.pending_count == 0
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_controller_readiness_requires_the_current_socket(monkeypatch):
+    adapter = _adapter()
+    monkeypatch.setattr(adapter, "_browser_control_enabled", lambda: True)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        sockets = []
+        for generation in ("first", "second"):
+            response = await client.post(
+                "/v1/browser-control/register",
+                json=_registration_body(),
+                headers={"Authorization": f"Bearer {API_KEY}"},
+            )
+            assert response.status == 201
+            registration = await response.json()
+            ws = await client.ws_connect(
+                "/v1/browser-control/ws",
+                protocols=[CONTROL_PROTOCOL, _ticket_protocol(registration["ticket"])],
+            )
+            await _wait_for_controller_ready(
+                ws, f"heartbeat-owner-{generation}-fixture"
+            )
+            sockets.append(ws)
+        with pytest.raises(asyncio.TimeoutError):
+            await _wait_for_controller_ready(
+                sockets[0], "heartbeat-stale-owner-fixture"
+            )
+        await _wait_for_controller_ready(sockets[1], "heartbeat-current-owner-fixture")
+        assert adapter._browser_control_broker.pending_count == 0
+        for ws in sockets:
+            await ws.close()

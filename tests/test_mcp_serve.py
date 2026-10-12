@@ -1366,6 +1366,9 @@ class TestEventBridgePollE2E:
 
         bridge = mcp_serve.EventBridge()
         bridge._establish_baseline()
+        assert mcp_serve._hermes_home() == tmp_path
+        before = db_path.stat()
+        assert bridge._state_db_mtime == before.st_mtime
         # Messages that existed before start() are not replayed.
         assert bridge.poll_events(after_cursor=0)["events"] == []
 
@@ -1374,11 +1377,14 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+        assert db_path.stat().st_mtime != before.st_mtime
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
         assert events[0]["content"] == "arrived after start"
+        bridge._poll_once(DB())
+        assert bridge.poll_events(after_cursor=0)["events"] == events
 
     def test_new_conversation_after_baseline_is_delivered(self, tmp_path, monkeypatch):
         """A conversation that first appears AFTER the startup baseline is still
@@ -1400,6 +1406,9 @@ class TestEventBridgePollE2E:
 
         bridge = mcp_serve.EventBridge()
         bridge._establish_baseline()  # no conversations exist yet
+        assert mcp_serve._hermes_home() == tmp_path
+        before = db_path.stat()
+        assert bridge._state_db_mtime == before.st_mtime
 
         # The gateway registers a brand-new conversation + its first message.
         sid = "20260329_150000_fresh"
@@ -1412,13 +1421,16 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
+        os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+        assert db_path.stat().st_mtime != before.st_mtime
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
         assert events[0]["session_key"] == "agent:main:telegram:dm:fresh"
         assert events[0]["content"] == "hello after baseline"
+        bridge._poll_once(DB())
+        assert bridge.poll_events(after_cursor=0)["events"] == events
 
     def test_poll_interval_is_200ms(self):
         """Verify the poll interval constant."""

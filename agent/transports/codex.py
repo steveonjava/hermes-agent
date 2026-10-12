@@ -585,6 +585,18 @@ class ResponsesApiTransport(ProviderTransport):
         if params.get("request_overrides"):
             kwargs.update(params["request_overrides"])
 
+        # The native gate owns this field, including after a provider rejection.
+        # SDK extra_body wins over typed kwargs, so it cannot be an escape hatch.
+        kwargs.pop("context_management", None)
+        extra_body = kwargs.get("extra_body")
+        if isinstance(extra_body, dict) and "context_management" in extra_body:
+            kwargs["extra_body"] = {
+                key: value for key, value in extra_body.items()
+                if key != "context_management"
+            }
+        if native_compaction_active:
+            kwargs["context_management"] = context_management
+
         _sanitize_astra_request_kwargs(kwargs, model, params.get("base_url"))
 
         _bound_prompt_cache_key_field(kwargs)

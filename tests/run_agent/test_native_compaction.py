@@ -1,9 +1,10 @@
-"""Tests for native OpenAI Responses server-side compaction (gpt-5.6 only).
+"""Tests for native OpenAI Responses compaction model and route contracts.
 
 Live behavior verified 2026-08-08 against api.openai.com: gpt-5.6 and
 gpt-5.3-codex accept ``context_management`` and emit compaction items;
 gpt-5.1/gpt-5.2 fail server-side (HTTP 500 / stream stall) with no
-structured rejection — hence the hard model-family gate these tests pin.
+structured rejection. The model gate requires numeric (major, minor) >= (5, 6),
+including future families, independently of route approval.
 """
 
 from types import SimpleNamespace
@@ -46,12 +47,43 @@ class TestModelGate:
         assert is_native_compaction_model("gpt-5.6-mini")
         assert is_native_compaction_model("GPT-5.6-2026-07-15")
 
+    @pytest.mark.parametrize("model", (
+        "gpt-6", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-terra", "gpt-6-astra-900k",
+        "gpt-6.2-future", "gpt-6.9-future-mini-2027-01-01", "gpt-6future",
+        "gpt-6.1-sol-chatgpt-tier", "gpt-6-luna-chatgpt-tier",
+        "openai/gpt-6", " OpenAI/GPT-6.2-FUTURE-CHATGPT-TIER ",
+    ))
+    def test_gpt6_family_eligible_independent_of_route(self, model):
+        assert is_native_compaction_model(model)
+
+    @pytest.mark.parametrize("model", (
+        "gpt-5.7", "gpt-5.8", "gpt-5.9", "gpt-5.99", "gpt-7",
+        "openai/GPT-7.1-sol", " OpenAI/GPT-7.1-SOL ", "gpt-8",
+        "gpt-8.2-future", "vendor/nested/gpt-8.2-future-mini-2027-01-01",
+    ))
+    def test_newer_version_families_eligible(self, model):
+        assert is_native_compaction_model(model)
+
+    @pytest.mark.parametrize("model", ("gpt-5.10", "gpt-5.59", "gpt-5.60", "gpt-10"))
+    def test_version_comparison_not_lexicographic(self, model):
+        assert is_native_compaction_model(model)
+
     def test_other_models_ineligible(self):
         # gpt-5.1/5.2 fail server-side on context_management (live-verified);
-        # gpt-5.3-codex works upstream but is outside the supported set.
-        for model in ("gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-4o", "o3", ""):
+        # gpt-5.3-codex works upstream but is below the version threshold.
+        # gpt-4o has major 4, not a numeric minor version, so it stays below 5.6.
+        for model in (
+            "gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-5.5", "gpt-4o",
+        ):
             assert not is_native_compaction_model(model)
-        assert not is_native_compaction_model(None)
+
+    @pytest.mark.parametrize("model", (
+        "o3", "", None, "not-gpt-6", "gpt-6/claude-tier",
+        "not-gpt-5.6", "vendor/not-gpt-5.6", "gpt-5.6/claude-tier",
+    ))
+    def test_without_leading_numeric_gpt_version_ineligible(self, model):
+        # The final path segment must start with gpt-<number>, regardless of threshold.
+        assert not is_native_compaction_model(model)
 
 
 class TestRouteGate:
@@ -158,8 +190,9 @@ class TestRequestGate:
             is None
         )
 
-    def test_xai_and_github_surfaces_never_send(self):
-        agent = _agent()
+    @pytest.mark.parametrize("model", ("gpt-5.6", "gpt-6.2-future"))
+    def test_xai_and_github_surfaces_never_send(self, model):
+        agent = _agent(model=model, capabilities={"openai_native_compaction": True})
         assert (
             native_compaction_context_management(
                 agent, is_codex_backend=False, is_xai_responses=True

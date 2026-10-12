@@ -13,13 +13,11 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
-    #
-    # Use the public hosted runner so this required gate cannot remain queued
-    # behind unavailable private large-runner capacity.
+    name: Run tests (shard ${{ matrix.slice }}/4)
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -92,33 +90,123 @@ jobs:
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
         #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
+        # Each fresh checkout uses identical tracked duration inputs. Do not
+        # restore a mutable duration cache before the runner partitions files.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          workers=$(python - <<'PY'
+          import errno
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          limits = [4]
+          measurements = {}
+          try:
+              online = os.sysconf('SC_NPROCESSORS_ONLN')
+              affinity = len(os.sched_getaffinity(0))
+              if online < 1 or affinity < 1:
+                  raise ValueError('No usable CPUs')
+              limits.extend((online, affinity))
+              measurements.update(online=online, affinity=affinity)
+          except (OSError, ValueError) as exc:
+              measurements['cpu_error'] = str(exc)
+              limits.append(1)
+          try:
+              groups = [line.split(':', 2) for line in Path('/proc/self/cgroup').read_text(encoding='utf-8').splitlines()]
+              if not groups or any(len(group) != 3 or not group[0].isdigit() for group in groups):
+                  raise ValueError('Invalid cgroup membership')
+              root = Path('/sys/fs/cgroup')
+              v2 = (root / 'cgroup.controllers').exists()
+              if v2:
+                  matches = [path for hierarchy, controllers, path in groups if hierarchy == '0' and not controllers]
+              else:
+                  matches = [path for _, controllers, path in groups if 'cpu' in controllers.split(',')]
+              if len(matches) != 1:
+                  raise ValueError('Ambiguous CPU cgroup membership')
+              relative = matches[0]
+              if not relative.startswith('/') or any(part in ('.', '..') for part in relative.split('/')):
+                  raise ValueError('Invalid cgroup path')
+              if not v2:
+                  cpu_root = next(path for path in (root / 'cpu', root / 'cpu,cpuacct') if path.is_dir()).resolve(strict=True)
+                  if not cpu_root.is_relative_to(root):
+                      raise ValueError('CPU cgroup mount escapes the hierarchy')
+                  root = cpu_root
+              mounts = []
+              for line in Path('/proc/self/mountinfo').read_text(encoding='utf-8').splitlines():
+                  fields, filesystem = line.split(' - ', 1)
+                  fields, filesystem = fields.split(), filesystem.split()
+                  if (len(fields) < 6 or len(filesystem) != 3 or
+                      not fields[0].isdigit() or not fields[1].isdigit() or
+                      re.fullmatch(r'[0-9]+:[0-9]+', fields[2]) is None):
+                      raise ValueError('Invalid cgroup mount metadata')
+                  hierarchy, mountpoint = [re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), value)
+                                           for value in fields[3:5]]
+                  if any(not value.startswith('/') or '\\' in value or
+                         any(part in ('.', '..') for part in value.split('/')) for value in (hierarchy, mountpoint)):
+                      raise ValueError('Invalid cgroup mount path')
+                  mounts.append((Path(hierarchy), Path(mountpoint), filesystem[0]))
+              mapped = [(hierarchy, kind) for hierarchy, mountpoint, kind in mounts if mountpoint == root]
+              if len(mapped) != 1 or mapped[0][1] != ('cgroup2' if v2 else 'cgroup'):
+                  raise ValueError('Unknown CPU cgroup mount')
+              mount_root = mapped[0][0]
+              if any(mountpoint != root and mountpoint.is_relative_to(root) for _, mountpoint, _ in mounts):
+                  raise ValueError('Obscured cgroup interfaces')
+              if not Path(relative).is_relative_to(mount_root):
+                  raise ValueError('Cgroup membership is outside its mount')
+              current = root / Path(relative).relative_to(mount_root)
+              if root.resolve(strict=True) != root or current.resolve(strict=True) != current or not current.is_dir():
+                  raise ValueError('Invalid mapped cgroup directory')
+              quotas = {}
+              measurements['cgroup_quotas'] = quotas
+              for directory in (current, *current.parents):
+                  if not directory.is_relative_to(root):
+                      continue
+                  if v2:
+                      try:
+                          quota, period = (directory / 'cpu.max').read_text(encoding='utf-8').split()
+                      except FileNotFoundError as exc:
+                          if exc.errno != errno.ENOENT or directory != root or mount_root != Path('/'):
+                              raise
+                          entries = {entry.name for entry in root.iterdir()}
+                          if 'cpu.max' in entries or 'cgroup.events' in entries or not {
+                              'cgroup.controllers', 'cgroup.procs', 'cgroup.subtree_control'
+                          }.issubset(entries):
+                              raise ValueError('Unproven physical cgroup root') from exc
+                          if 'cpu' not in (root / 'cgroup.controllers').read_text(encoding='utf-8').split():
+                              raise ValueError('CPU controller is unavailable') from exc
+                          (root / 'cgroup.procs').read_text(encoding='utf-8')
+                          (root / 'cgroup.subtree_control').read_text(encoding='utf-8')
+                          # Both interfaces are non-root-only; a namespaced child keeps cgroup.events.
+                          measurements['physical_cgroup_root'] = str(root)
+                          measurements['root_cpu_max'] = 'absent'
+                          continue
+                  else:
+                      quota = (directory / 'cpu.cfs_quota_us').read_text(encoding='utf-8').strip()
+                      period = (directory / 'cpu.cfs_period_us').read_text(encoding='utf-8').strip()
+                  period = int(period)
+                  if period <= 0:
+                      raise ValueError('Invalid CPU quota period')
+                  quotas[str(directory)] = [quota, period]
+                  if quota != ('max' if v2 else '-1'):
+                      capacity = int(quota) / period
+                      if capacity <= 0:
+                          raise ValueError('Invalid CPU quota')
+                      limits.append(capacity)
+          except (OSError, ValueError, OverflowError, RuntimeError, StopIteration) as exc:
+              measurements['quota_error'] = str(exc)
+              limits.append(1)
+          workers = max(1, math.floor(min(limits)))
+          measurements['workers'] = workers
+          print(json.dumps(measurements, sort_keys=True), file=sys.stderr)
+          print(workers)
+          PY
+          )
+          scripts/run_tests.sh -j "$workers" --slice "${{ matrix.slice }}/4"
         env:
-          # This is the maximum number of test FILES that run together.
-          # run_tests_parallel.py starts one pytest subprocess for each file
-          # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # default is cpu_count*2, which is 192 here.
-          #
-          # Measured on this runner (96-core EPYC 7763, 377GB). Whole suite,
-          # two repetitions for each value. See run 32549672063:
-          #
-          #     workers   x cores   mean
-          #        48       0.5x    138s
-          #        96       1.0x    126s   <- fastest
-          #       144       1.5x    132s
-          #       192       2.0x    132s
-          #       240       2.5x    140s
-          #       288       3.0x    142s
-          #
-          # One worker for each core wins. The curve is shallow: 126s to 142s
-          # across a 6x range. The suite has sufficient concurrency at this
-          # size. The remaining time is the slowest files plus the setup.
-          # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

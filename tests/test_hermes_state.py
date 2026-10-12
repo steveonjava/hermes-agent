@@ -903,45 +903,59 @@ class TestFTS5Search:
         ]
         assert all("context" in row and row["context"] for row in default)
 
-    def test_search_projection_skips_context_enrichment_queries(self, db):
+    def test_search_projection_skips_context_enrichment_queries(self, db, monkeypatch):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="before")
         db.append_message("s1", role="assistant", content="projectionneedle")
         db.append_message("s1", role="user", content="after")
 
+        # Warm SQLite's per-connection FTS setup before comparing query work.
+        db.search_messages("projectionneedle", fields=("session_id", "snippet"))
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        from contextlib import contextmanager
 
-        def context_query_count():
-            normalized = (" ".join(sql.upper().split()) for sql in statements)
-            return sum("WITH TARGET AS (" in sql for sql in normalized)
+        read_ctx = db._read_ctx
 
-        try:
-            projected = db.search_messages(
-                "projectionneedle", fields=("session_id", "snippet")
-            )
-            assert len(projected) == 1
-            assert context_query_count() == 0
+        @contextmanager
+        def traced_read_ctx():
+            with read_ctx() as conn:
+                conn.set_trace_callback(statements.append)
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
 
-            full = db.search_messages(
-                "projectionneedle", fields=("session_id", "context")
-            )
-            assert len(full) == 1
-            assert full[0]["context"]
-            assert context_query_count() == 1
+        monkeypatch.setattr(db, "_read_ctx", traced_read_ctx)
 
-            default = db.search_messages("projectionneedle")
-            assert len(default) == 1
-            assert default[0]["context"]
-            assert context_query_count() == 2
-        finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
+        def query_count():
+            # SQLite also traces FTS shadow-table work with a leading "--".
+            return sum(sql.lstrip().upper().startswith(("SELECT", "WITH")) for sql in statements)
+
+        projected = db.search_messages(
+            "projectionneedle", fields=("session_id", "snippet")
+        )
+        assert len(projected) == 1
+        projection_queries = query_count()
+        assert projection_queries > 0
+        assert "context" not in projected[0]
+
+        statements.clear()
+        full = db.search_messages(
+            "projectionneedle", fields=("session_id", "context")
+        )
+        assert len(full) == 1
+        assert full[0]["context"] == [
+            {"role": "user", "content": "before"},
+            {"role": "assistant", "content": "projectionneedle"},
+            {"role": "user", "content": "after"},
+        ]
+        assert query_count() == projection_queries + 1
+
+        statements.clear()
+        default = db.search_messages("projectionneedle")
+        assert len(default) == 1
+        assert default[0]["context"] == full[0]["context"]
+        assert query_count() == projection_queries + 1
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""

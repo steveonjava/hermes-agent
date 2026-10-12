@@ -158,9 +158,11 @@ class TestDetectAudioEnvironmentTermuxFallback:
     no longer see the misleading 'Termux:API Android app is not installed'
     warning when the package-manager probe is inconclusive."""
 
+    @pytest.mark.parametrize("container", [False, True])
     def test_inconclusive_probes_with_binary_does_not_emit_app_warning(
-        self, monkeypatch
+        self, monkeypatch, container
     ):
+        monkeypatch.setattr("hermes_constants.is_container", lambda: container)
         monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
         monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
         monkeypatch.delenv("SSH_CLIENT", raising=False)
@@ -191,7 +193,7 @@ class TestDetectAudioEnvironmentTermuxFallback:
         from tools.voice_mode import detect_audio_environment
         result = detect_audio_environment()
 
-        assert result["available"] is True, (
+        assert result["available"] is (not container), (
             f"Voice mode should be available when the binary is on PATH "
             f"and probes are inconclusive (issue #31015). Got: {result}"
         )
@@ -207,6 +209,7 @@ class TestDetectAudioEnvironmentTermuxFallback:
             "Termux:API microphone recording available" in n
             for n in result.get("notices", [])
         )
+        assert any("Running inside container" in w for w in result["warnings"]) is container
 
     def test_clean_probes_no_match_still_blocks(self, monkeypatch):
         """The genuine "CLI installed without the app" case still blocks

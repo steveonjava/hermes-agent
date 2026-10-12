@@ -111,6 +111,9 @@ class TestCommandTimeoutRecovery:
         supervisor_events = []
 
         monkeypatch.setattr(bt_install, "_find_agent_browser", lambda: "agent-browser")
+        monkeypatch.setattr(bt_install, "_chromium_installed", lambda: True)
+        monkeypatch.setattr(bt_cloud, "_is_local_mode", lambda: not cloud)
+        monkeypatch.setattr(bt_session, "_read_browser_daemon_pid", lambda *_: None)
         monkeypatch.setattr("tools.browser_tool_install._requires_real_termux_browser_install", lambda _cmd: False)
         monkeypatch.setattr("tools.browser_tool_lifecycle._start_browser_cleanup_thread", lambda: None)
         monkeypatch.setattr("tools.browser_tool_cdp._ensure_cdp_supervisor", lambda _: supervisor_events.append("ensure"))
@@ -122,7 +125,9 @@ class TestCommandTimeoutRecovery:
         monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
 
-        bt_session._run_browser_command(task_id, "click", ["@e1"], timeout=1)
+        result = bt_session._run_browser_command(task_id, "click", ["@e1"], timeout=1)
+        assert not result["success"] and "timed out" in result["error"]
+        process.kill.assert_called_once()
 
         assert task_id not in bt._last_active_session_key
         assert not (tmp_path / "agent-browser-stuck-session").exists()
@@ -141,6 +146,20 @@ class TestCommandTimeoutRecovery:
         bt_lifecycle.cleanup_browser(task_id)
         provider.close_session.assert_called_once_with("cloud-session-1")
         assert supervisor_events == ["ensure", "stop", "stop"]
+
+    def test_responsive_local_daemon_remains_cached_but_suspect(self, monkeypatch, tmp_path):
+        task_id = "responsive-command"
+        session_info = {"session_name": "responsive-session"}
+        bt._active_sessions[task_id] = session_info
+        monkeypatch.setattr(bt_session, "_read_browser_daemon_pid", lambda *_: 123)
+        monkeypatch.setattr(bt_lifecycle, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(bt_lifecycle, "_verify_reapable_browser_daemon", lambda *_: True)
+        monkeypatch.setattr(bt_session, "_browser_daemon_responsive", lambda *_: True)
+        bt_session._handle_browser_command_timeout(task_id, session_info, str(tmp_path))
+        assert bt._active_sessions[task_id] is session_info
+        assert task_id in bt._suspect_browser_sessions
+        assert tmp_path.exists()
+        bt._suspect_browser_sessions.pop(task_id)
 
     def test_stale_timeout_cannot_remove_concurrent_replacement(self, tmp_path):
         stale, replacement = {"session_name": "stale"}, {"session_name": "replacement"}

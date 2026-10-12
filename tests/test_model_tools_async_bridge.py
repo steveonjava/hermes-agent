@@ -352,38 +352,29 @@ class TestVisionDispatchLoopSafety:
     verify the event loop stays alive afterwards — the exact scenario
     from issue #2104."""
 
-    def test_vision_dispatch_keeps_loop_alive(self, tmp_path):
+    def test_vision_dispatch_keeps_loop_alive(self, vision_image):
         """After dispatching vision_analyze via the registry, the event
         loop must remain open so cached async clients don't crash on GC."""
         from model_tools import _get_tool_loop
         from tools.registry import registry
 
         fake_response = _mock_vision_response()
+        observed_loops = []
+
+        async def respond(*args, **kwargs):
+            observed_loops.append(asyncio.get_running_loop())
+            return fake_response
 
         with (
             patch(
                 "tools.vision_tools.async_call_llm",
                 new_callable=AsyncMock,
-                return_value=fake_response,
-            ),
-            patch(
-                "tools.vision_tools._download_image",
-                new_callable=AsyncMock,
-                side_effect=lambda url, dest, **kw: _write_fake_image(dest),
-            ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/jpeg;base64,abc",
+                side_effect=respond,
             ),
         ):
             result_json = registry.dispatch(
                 "vision_analyze",
-                {"image_url": "https://example.com/cat.png", "question": "What is this?"},
+                {"image_url": vision_image, "question": "What is this?"},
             )
 
         result = json.loads(result_json)
@@ -391,12 +382,13 @@ class TestVisionDispatchLoopSafety:
         assert "cat" in result.get("analysis", "").lower()
 
         loop = _get_tool_loop()
+        assert observed_loops == [loop]
         assert not loop.is_closed(), (
             "Event loop closed after vision_analyze dispatch — cached async "
             "clients will crash with 'Event loop is closed' (issue #2104)"
         )
 
-    def test_two_consecutive_vision_dispatches(self, tmp_path):
+    def test_two_consecutive_vision_dispatches(self, vision_image):
         """Two back-to-back vision_analyze dispatches must both succeed
         and share the same loop (simulates 'first call fails, second
         works' from the issue report)."""
@@ -404,29 +396,20 @@ class TestVisionDispatchLoopSafety:
         from tools.registry import registry
 
         fake_response = _mock_vision_response()
+        observed_loops = []
+
+        async def respond(*args, **kwargs):
+            observed_loops.append(asyncio.get_running_loop())
+            return fake_response
 
         with (
             patch(
                 "tools.vision_tools.async_call_llm",
                 new_callable=AsyncMock,
-                return_value=fake_response,
-            ),
-            patch(
-                "tools.vision_tools._download_image",
-                new_callable=AsyncMock,
-                side_effect=lambda url, dest, **kw: _write_fake_image(dest),
-            ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/jpeg;base64,abc",
+                side_effect=respond,
             ),
         ):
-            args = {"image_url": "https://example.com/cat.png", "question": "Describe"}
+            args = {"image_url": vision_image, "question": "Describe"}
 
             r1 = json.loads(registry.dispatch("vision_analyze", args))
             loop_after_first = _get_tool_loop()
@@ -436,12 +419,28 @@ class TestVisionDispatchLoopSafety:
 
         assert r1.get("success") is True
         assert r2.get("success") is True
+        assert observed_loops == [loop_after_first, loop_after_second]
         assert loop_after_first is loop_after_second, "Loop changed between dispatches"
         assert not loop_after_second.is_closed()
 
 
-def _write_fake_image(dest):
-    """Write minimal bytes so vision_analyze_tool thinks download succeeded."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(b"\xff\xd8\xff" + b"\x00" * 16)
-    return dest
+@pytest.fixture
+def vision_image():
+    import base64
+    from io import BytesIO
+    from PIL import Image
+
+    image = BytesIO()
+    Image.new("RGB", (2, 2), color="red").save(image, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(image.getvalue()).decode("ascii")
+
+
+def test_vision_dispatch_rejects_unsupported_media_before_llm():
+    from tools.registry import registry
+
+    with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as llm:
+        result = json.loads(registry.dispatch(
+            "vision_analyze", {"image_url": "ftp://fixture.invalid/image", "question": "Describe"}
+        ))
+    assert not result["success"]
+    llm.assert_not_awaited()
