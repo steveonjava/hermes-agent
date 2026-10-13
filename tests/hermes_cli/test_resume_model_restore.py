@@ -251,6 +251,11 @@ def test_startup_resume_rehydrates_trusted_proxy_capabilities(tmp_path, monkeypa
     )
     db.append_message("startup-resume", "user", "resume me")
 
+    # Resume changes homes after CLI import; keep logging outside this routing fixture.
+    import hermes_logging
+    hermes_logging._stop_queue_listener()
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda **kwargs: None)
+    monkeypatch.setattr("hermes_logging.setup_verbose_logging", lambda **kwargs: None)
     shell = cli_mod.HermesCLI(resume="startup-resume", compact=True, max_turns=1)
     shell._session_db = db
     shell._console_print = lambda *a, **k: None
@@ -260,7 +265,6 @@ def test_startup_resume_rehydrates_trusted_proxy_capabilities(tmp_path, monkeypa
     assert shell.requested_provider == "custom:trusted-proxy"
 
     monkeypatch.setattr(shell, "_install_tool_callbacks", lambda: None)
-    monkeypatch.setattr(shell, "_ensure_tirith_security", lambda: None)
     monkeypatch.setattr(shell, "finalize_preloaded_skills", lambda: None)
     monkeypatch.setattr(cli_mod, "_prepare_deferred_agent_startup", lambda: None)
     monkeypatch.setattr(
@@ -275,9 +279,9 @@ def test_startup_resume_rehydrates_trusted_proxy_capabilities(tmp_path, monkeypa
     }
 
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI", return_value=MagicMock()),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
     ):
         assert shell._init_agent(
             model_override=turn_route["model"],
@@ -311,7 +315,7 @@ def test_persist_model_switch_writes_model_and_both_route_shapes():
     stub = _make_stub(_session_db=_DB(), session_id="s1")
     stub._persist_model_switch_to_session(_Result())
     assert written["model"] == ("s1", "deepseek-v4-flash-free")
-    sid, patch = written["patch"]
+    _sid, patch = written["patch"]
     # Nested shape for the CLI reader...
     assert patch["gateway_runtime"]["provider"] == "custom:opencode-zen"
     # ...and top-level for the TUI gateway's _stored_session_runtime_overrides.
@@ -540,6 +544,18 @@ def test_session_gateway_runtime_explicit_provider_wins_over_billing():
     meta["billing_provider"] = "minimax"
     runtime = SessionDB.session_gateway_runtime(meta)
     assert runtime == {"provider": "nous"}
+
+
+def test_session_gateway_runtime_billing_provider_fills_top_level_route_without_provider():
+    """A TUI row with top-level base_url/api_mode but no provider keeps that endpoint AND takes the
+    provider the session was billed to — the same merge the TUI gateway always did (#125942); a bare
+    bucket still contributes nothing."""
+    meta = _row(model_config={"base_url": "https://f/v1", "api_mode": "chat_completions"})
+    meta["billing_provider"] = "minimax"
+    assert SessionDB.session_gateway_runtime(meta) == {
+        "provider": "minimax", "base_url": "https://f/v1", "api_mode": "chat_completions"}
+    meta["billing_provider"] = "custom"
+    assert SessionDB.session_gateway_runtime(meta) == {"base_url": "https://f/v1", "api_mode": "chat_completions"}
 
 
 def test_restore_session_model_restores_billing_provider_fallback():

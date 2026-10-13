@@ -167,6 +167,24 @@ class TestRestorePrimaryRuntime:
         assert agent._fallback_activated is False
         assert agent._restore_primary_runtime() is False
 
+    def test_reasoning_replay_verdict_does_not_follow_the_session_to_another_route(self):
+        """#61552: a replay kill switch tripped on one route must not disable replay on the next."""
+        agent = _make_agent(fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"})
+        tripped = (False, True)
+
+        def verdict():
+            return agent._codex_reasoning_replay_enabled, agent._codex_reasoning_replay_rejected
+
+        agent._codex_reasoning_replay_enabled, agent._codex_reasoning_replay_rejected = tripped
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_resolve(), None)):
+            assert agent._try_activate_fallback() is True
+        assert verdict() == (True, False)
+
+        agent._codex_reasoning_replay_enabled, agent._codex_reasoning_replay_rejected = tripped
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert verdict() == (True, False)
+
 
     def test_restores_model_provider_and_flags(self):
         agent = _make_agent(
@@ -214,7 +232,7 @@ class TestRestorePrimaryRuntime:
         assert agent.capabilities == {}
         assert agent.runtime_capabilities == {"native_compaction": False}
 
-        with patch("run_agent.OpenAI", return_value=MagicMock()):
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             assert agent._restore_primary_runtime() is True
 
         assert agent.capabilities == provider_capabilities
