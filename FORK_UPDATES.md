@@ -18,7 +18,7 @@ release does not rerun the suite. This helper updates GitHub only, never hosts.
 Prepare manually (does not push):
 
 ```sh
-python3 scripts/fork_sync.py --work-root /tmp/hermes-fork-sync
+python3 scripts/fork_sync.py --work-root "${XDG_CACHE_HOME:-$HOME/.cache}/hermes-fork-sync"
 ```
 
 Use the existing maintainer Git credential. The default GitHub Actions token
