@@ -57,7 +57,7 @@ def _replay(tmp_path, comparison, *, labels=(), direct=False, failures=0):
     gh.chmod(0o755)
     (bindir / "python3").symlink_to(sys.executable)
     sleep = bindir / "sleep"
-    sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$FIXTURE_SLEEPS"\n', encoding="utf-8")
+    sleep.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$FIXTURE_SLEEPS"\n', encoding="utf-8")
     sleep.chmod(0o755)
     output = tmp_path / "outputs"
     env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ["PATH"],
