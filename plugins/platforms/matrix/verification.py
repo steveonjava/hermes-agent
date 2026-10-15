@@ -141,7 +141,7 @@ def _txid_from(content: Any, event: Any = None) -> str:
     return ""
 
 
-def _compute_commitment(our_pubkey_b64: str, start_content: Dict[str, Any]) -> str:
+def _compute_commitment(our_pubkey_b64: str, start_content: dict[str, Any]) -> str:
     """Compute the SAS commitment exactly like matrix-rust-sdk.
 
     commitment = unpadded_base64(SHA256(our_pubkey_b64 + canonical_json(start_content)))
@@ -205,7 +205,7 @@ class SasVerificationHandler:
         self._adapter = adapter
         self._client = client
         self._olm = olm
-        self._sessions: Dict[str, _SasSession] = {}
+        self._sessions: dict[str, _SasSession] = {}
         self._registered = False
 
     # ------------------------------------------------------------------
@@ -839,7 +839,7 @@ class SasVerificationHandler:
         mac_func = self._mac_func(session)
         info = self._mac_info_for(session, our_side=True)
 
-        keys_to_mac: Dict[str, str] = {}
+        keys_to_mac: dict[str, str] = {}
         # Our device ed25519 key.
         try:
             device_key = self._olm.account.identity_keys.get("ed25519")
@@ -917,7 +917,7 @@ class SasVerificationHandler:
             await self._ensure_user_keys(session)
 
             # Build key_id -> public key map from what we know about the user.
-            known: Dict[str, str] = {}
+            known: dict[str, str] = {}
             try:
                 dev = await self._olm.crypto_store.get_device(
                     session.other_user, session.other_device
@@ -1007,7 +1007,7 @@ class SasVerificationHandler:
     # Messaging helpers
     # ------------------------------------------------------------------
 
-    async def _send(self, event_name: str, session: _SasSession, content: Dict[str, Any]) -> bool:
+    async def _send(self, event_name: str, session: _SasSession, content: dict[str, Any]) -> bool:
         """Send a verification event via the session's transport.
 
         In-room sessions (MSC 2241) send timeline events chained via
@@ -1019,7 +1019,7 @@ class SasVerificationHandler:
         return await self._send_to_device(event_name, session, content)
 
     async def _send_room_event(
-        self, event_name: str, session: _SasSession, content: Dict[str, Any]
+        self, event_name: str, session: _SasSession, content: dict[str, Any]
     ) -> Optional[str]:
         """Send an in-room verification event (MSC 2241).
 
@@ -1063,7 +1063,7 @@ class SasVerificationHandler:
             logger.warning("Matrix: send room event %s failed: %s", event_name, exc)
             return None
 
-    async def _send_to_device(self, event_name: str, session: _SasSession, content: Dict[str, Any]) -> bool:
+    async def _send_to_device(self, event_name: str, session: _SasSession, content: dict[str, Any]) -> bool:
         from mautrix.types import EventType
 
         evt_type = EventType.find(event_name, EventType.Class.TO_DEVICE)
