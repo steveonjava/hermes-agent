@@ -43,6 +43,15 @@ def test_planned_restart_notification_uses_marker_message(tmp_path, monkeypatch)
     )
 
 
+def test_planned_restart_notification_reads_utf8_bom_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    message = "Restart complete; awaiting operator continuation."
+    (tmp_path / ".restart_pending.json").write_text(
+        json.dumps({"message": message}), encoding="utf-8-sig"
+    )
+    assert gateway_run._planned_restart_notification_message() == message
+
+
 @pytest.mark.asyncio
 async def test_planned_restart_sends_marker_message_and_clears_marker(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
