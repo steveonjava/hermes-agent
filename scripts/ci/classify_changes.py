@@ -704,7 +704,8 @@ def pull_request_labels() -> list[str]:
 
 def main() -> int:
     files = sys.stdin.read().splitlines()
-    if not any(f.strip() for f in files):
+    force_all = os.environ.get("CI_CLASSIFY_FORCE_ALL") == "1"
+    if not force_all and not any(f.strip() for f in files):
         recovered = pull_request_changed_files()
         if recovered:
             print(
@@ -713,7 +714,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             files = recovered
-    lanes = classify(files, run_e2e=RUN_E2E_LABEL in pull_request_labels())
+    # The action's incomplete comparison is authoritative, unlike direct CLI input.
+    lanes = classify([]) if force_all else classify(files, run_e2e=RUN_E2E_LABEL in pull_request_labels())
     out = "\n".join(f"{key}={str(value).lower()}" for key, value in lanes.items())
     if dest := os.environ.get("GITHUB_OUTPUT"):
         with open(dest, "a", encoding="utf-8") as fh:

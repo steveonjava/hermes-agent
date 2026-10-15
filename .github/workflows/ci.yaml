@@ -71,7 +71,8 @@ jobs:
   detect:
     name: Detect affected areas
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    # Cover cold checkout plus the bounded API retries/backoff before fail-open.
+    timeout-minutes: 5
     outputs:
       python: ${{ steps.gate-lanes.outputs.python }}
       python_prod: ${{ steps.gate-lanes.outputs.python_prod }}
