@@ -27,6 +27,26 @@ not required. Scheduling and host deployment stay with the existing controller.
 Do not squash/rebase upstream integration merges: retain their ancestry so future
 merges recognize releases already included.
 
+## Fork CI policy
+
+Official stable releases are trusted as qualified by upstream. Fork CI does not
+repeat upstream's full test matrix, packaging, contributor attribution or review
+of unchanged official source. It tests the impact of our retained modifications.
+
+The read-only `Fork CI` workflow and source-sync helper use the same check command:
+prepare the supported PM environment, verify the fork-only delta, then run the
+focused customization, Matrix, model/provider, updater and CI regression tests.
+The delta baseline is the newest included stable tag fetched directly from the
+official repository into a separate namespace, not a fork-created tag. Missing
+or unverifiable baselines fail rather than silently skipping checks. New fork
+size, encoded-command and lint violations remain blocking.
+
+Keep `Fork CI` enabled and inherited upstream workflows disabled using GitHub's
+native workflow settings in this fork. Their source files stay intact for future
+upstream merges. This replaces their role in fork acceptance; it does not claim
+that their historical failures passed or requalify the official release.
+The workflow has no source-publishing or deployment credentials and no schedule.
+
 ## Ordinary installations
 
 Install as the account that will run Hermes. Use the stock installer with

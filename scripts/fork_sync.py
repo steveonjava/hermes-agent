@@ -118,11 +118,17 @@ def check_command():
         'tests/hermes_cli/test_update_upstream_prompt_noninteractive.py',
         'tests/hermes_cli/test_version_*.py',
         'tests/scripts/test_fork_sync.py',
+        'tests/scripts/test_fork_ci.py',
+        'tests/scripts/test_fork_check_command.py',
+        'tests/ci/test_detect_changes_compare.py',
+        'tests/ci/test_classify_changes.py',
+        'tests/ci/test_update_ci_routing.py',
     ]
     # The explicit CI venv avoids treating PM's installed source as live home state.
     prepare = ('CC=gcc CXX=g++ python -m pm.build_env --source "$PWD" --out "$PWD/.venv-fork-tests" '
                '--group dev --group test --extra all --extra matrix')
-    checks = ('env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv-fork-tests/bin/python" '
+    checks = ('"$PWD/.venv-fork-tests/bin/python" scripts/fork_ci.py && '
+              'env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv-fork-tests/bin/python" '
               'scripts/run_tests.sh --file-retries 0 -q ' + ' '.join(paths))
     return ['bash', '-c', 'scripts/run-in-hermes-env bash -c ' + shlex.quote(prepare + ' && ' + checks)]
 
