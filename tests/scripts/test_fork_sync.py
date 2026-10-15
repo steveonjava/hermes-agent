@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from unittest import mock
 import pathlib
 import subprocess
@@ -11,7 +12,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 
 def git(path, *args):
-    return subprocess.check_output(['git', '-C', str(path), *args], text=True).strip()
+    return subprocess.check_output(['git', '-C', str(path), *args], text=True, encoding='utf-8').strip()
 
 
 class ForkSyncTests(unittest.TestCase):
@@ -24,7 +25,7 @@ class ForkSyncTests(unittest.TestCase):
         git(self.upstream, 'init', '-q', '-b', 'main')
         git(self.upstream, 'config', 'user.name', 'Fixture')
         git(self.upstream, 'config', 'user.email', 'fixture@invalid')
-        (self.upstream / 'core.txt').write_text('old\n')
+        (self.upstream / 'core.txt').write_text('old\n', encoding='utf-8')
         git(self.upstream, 'add', 'core.txt')
         git(self.upstream, 'commit', '-qm', 'base')
         self.fork = self.root / 'fork.git'
@@ -33,12 +34,12 @@ class ForkSyncTests(unittest.TestCase):
         subprocess.run(['git', 'clone', '-q', str(self.fork), str(local)], check=True)
         git(local, 'config', 'user.name', 'Fixture')
         git(local, 'config', 'user.email', 'fixture@invalid')
-        (local / 'custom.txt').write_text('keep our patch\n')
+        (local / 'custom.txt').write_text('keep our patch\n', encoding='utf-8')
         git(local, 'add', 'custom.txt')
         git(local, 'commit', '-qm', 'fork patch')
         git(local, 'push', '-q', 'origin', 'main')
         self.before = git(self.fork, 'rev-parse', 'main')
-        (self.upstream / 'core.txt').write_text('new\n')
+        (self.upstream / 'core.txt').write_text('new\n', encoding='utf-8')
         git(self.upstream, 'add', 'core.txt')
         git(self.upstream, 'commit', '-qm', 'release')
         git(self.upstream, 'tag', '-a', 'v1.2.3', '-m', 'release')
@@ -66,6 +67,21 @@ class ForkSyncTests(unittest.TestCase):
                      'tests/hermes_cli/test_model_switch_custom_providers.py',
                      'tests/hermes_cli/test_update_fork_sync_identity.py', 'tests/scripts/test_fork_sync.py']:
             self.assertIn(test, command[2])
+
+    def test_git_output_is_utf8_even_under_ascii_locale(self):
+        local = self.root / 'local'
+        git(local, 'commit', '--allow-empty', '-qm', 'caf\u00e9')
+        program = ("import importlib.util,sys; "
+                   "s=importlib.util.spec_from_file_location('helper',sys.argv[1]); "
+                   "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                   "value=m.run(sys.argv[2],'log','-1','--format=%s'); "
+                   "sys.stdout.buffer.write(value.encode('ascii','backslashreplace'))")
+        env = dict(os.environ, LC_ALL='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0')
+        result = subprocess.run([sys.executable, '-c', program,
+                                 str(HERE.parents[1] / 'scripts' / 'fork_sync.py'), str(local)],
+                                env=env, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr.decode('ascii', 'replace'))
+        self.assertEqual(result.stdout, b'caf\\xe9')
 
     def test_prepare_preserves_patches_and_does_not_push(self):
         result = self.run_sync()
@@ -96,7 +112,7 @@ class ForkSyncTests(unittest.TestCase):
                 self.run_sync(publish=True)
 
         report_path, = (self.root / 'work').glob('*-result.json')
-        report = json.loads(report_path.read_text())
+        report = json.loads(report_path.read_text(encoding='utf-8-sig'))
         checkout = pathlib.Path(report['checkout'])
         self.assertEqual(git(self.fork, 'rev-parse', 'main'), git(checkout, 'rev-parse', 'HEAD'))
         self.assertNotEqual(git(self.fork, 'rev-parse', 'main'), self.before)
@@ -146,7 +162,7 @@ class ForkSyncTests(unittest.TestCase):
         self.assertEqual(git(self.fork, 'rev-parse', 'main'), self.before)
 
     def test_merge_conflict_never_publishes(self):
-        (self.upstream / 'custom.txt').write_text('upstream incompatible feature\n')
+        (self.upstream / 'custom.txt').write_text('upstream incompatible feature\n', encoding='utf-8')
         git(self.upstream, 'add', 'custom.txt')
         git(self.upstream, 'commit', '-qm', 'conflicting release')
         git(self.upstream, 'tag', '-f', 'v1.2.3')

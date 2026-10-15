@@ -16,8 +16,8 @@ class SyncError(RuntimeError):
 
 
 def run(path, *args):
-    result = subprocess.run(['git', '-C', str(path), *args], text=True,
-                            capture_output=True, timeout=180)
+    result = subprocess.run(['git', '-C', str(path), *args], text=True, encoding='utf-8',
+                            capture_output=True, timeout=180, check=False)
     if result.returncode:
         raise SyncError(result.stderr.strip() or result.stdout.strip() or 'git failed')
     return result.stdout.strip()
@@ -56,7 +56,7 @@ def sync(work_root, fork_url, upstream_url, tag, checks, publish=False):
         if existing and run(checkout, 'rev-parse', 'refs/tags/' + tag) != tag_object:
             raise SyncError('fork already has a different tag object; refusing replacement')
         contained = subprocess.run(['git', '-C', str(checkout), 'merge-base', '--is-ancestor', upstream, 'HEAD'],
-                                   capture_output=True, timeout=30)
+                                   capture_output=True, timeout=30, check=False)
         if contained.returncode not in (0, 1):
             raise SyncError('could not compare fork and stable release')
         changed = contained.returncode == 1
@@ -68,7 +68,7 @@ def sync(work_root, fork_url, upstream_url, tag, checks, publish=False):
                          'HERMES_HOME': str(check_home / '.hermes'),
                          'HERMES_RUNTIME_DIR': str(check_home / 'runtime'),
                          'LANG': 'C.UTF-8', 'TERM': 'dumb', 'PYTHONDONTWRITEBYTECODE': '1'}
-            checked = subprocess.run(checks, cwd=checkout, env=check_env, timeout=3600)
+            checked = subprocess.run(checks, cwd=checkout, env=check_env, timeout=3600, check=False)
             if checked.returncode:
                 raise SyncError('checks failed; fork main was not published')
         after = run(checkout, 'rev-parse', 'HEAD')
@@ -88,9 +88,9 @@ def sync(work_root, fork_url, upstream_url, tag, checks, publish=False):
         result.update(changed=changed, published=publish, before=before, after=after, upstream=upstream)
     except (SyncError, OSError, subprocess.SubprocessError) as error:
         result.update(error=str(error))
-        (checkout.parent / (checkout.name + '-result.json')).write_text(json.dumps(result, indent=2) + '\n')
+        (checkout.parent / (checkout.name + '-result.json')).write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
         raise SyncError(str(error) + '\nPreserved checkout: ' + str(checkout)) from error
-    (checkout.parent / (checkout.name + '-result.json')).write_text(json.dumps(result, indent=2) + '\n')
+    (checkout.parent / (checkout.name + '-result.json')).write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
     return result
 
 

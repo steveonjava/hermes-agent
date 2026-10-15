@@ -518,7 +518,7 @@ def _is_bare_media_filename(msgtype: str, body: str) -> bool:
     return msgtype in ("m.audio", "m.file", "m.video") and _looks_like_matrix_media_filename(body)
 
 
-def _resolve_matrix_self_profile_sync(extra: Dict[str, Any]) -> dict[str, str] | None:
+def _resolve_matrix_self_profile_sync(extra: dict[str, Any]) -> dict[str, str] | None:
     """Return valid, explicitly configured global profile fields without env fallback."""
     configured = extra.get("self_profile")
     if not isinstance(configured, dict):
@@ -2124,7 +2124,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 if isinstance(result, Exception):
                     logger.warning("Matrix: event handler failed during sync dispatch: %s", result)
 
-    async def _dispatch_sas_to_device_events(self, sync_data: Dict[str, Any]) -> list:
+    async def _dispatch_sas_to_device_events(self, sync_data: dict[str, Any]) -> list:
         """Decrypt and dispatch non-key Olm to-device events for SAS verification."""
         client = self._client
         crypto = getattr(client, "crypto", None)

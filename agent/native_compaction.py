@@ -43,7 +43,7 @@ def is_native_compaction_model(
 
 def resolve_native_compaction_capabilities(
     *, model: Optional[str], base_url: Optional[str], provider: Optional[str] = None, is_codex_backend: bool = False,
-    provider_capabilities: Optional[Dict[str, Any]] = None,
+    provider_capabilities: Optional[dict[str, Any]] = None,
 ) -> dict[str, bool]:
     """Resolve the native-compaction capability for a runtime destination (a resolved ``False``
     is distinct from "unresolved" and must survive model switches unchanged)."""

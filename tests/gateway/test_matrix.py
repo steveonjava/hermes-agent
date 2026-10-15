@@ -430,7 +430,7 @@ class TestMatrixSelfProfileSync:
             "avatar_url": "mxc://matrix.example.org/hermes-avatar",
         }}))
         client = MagicMock()
-        client.get_displayname = AsyncMock(side_effect=asyncio.TimeoutError())
+        client.get_displayname = AsyncMock(side_effect=TimeoutError())
         client.set_displayname = AsyncMock()
         client.get_avatar_url = AsyncMock(return_value="Old avatar")
         client.set_avatar_url = AsyncMock()
@@ -3591,7 +3591,7 @@ class TestMatrixPermanentAuthClassifier:
     @pytest.mark.parametrize(
         "exc_factory",
         [
-            lambda: asyncio.TimeoutError("401 in the pagination token url"),
+            lambda: TimeoutError("401 in the pagination token url"),
             lambda: TimeoutError("403 in the pagination token url"),
             lambda: ConnectionError("... forbidden ..."),
             lambda: ConnectionResetError("Connection reset, status 401"),
