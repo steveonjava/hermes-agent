@@ -922,6 +922,7 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
                     "base_url": "http://1.2.3.4:1234/v1",
                     "api_key": "local-provider-key",
                     "model": "gpt-5.6",
+                    "api_mode": "codex_responses",
                     "capabilities": {"openai_native_compaction": True},
                 }
             ]
@@ -940,7 +941,7 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="local")
 
     assert resolved["provider"] == "custom"
-    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["api_mode"] == "codex_responses"
     assert resolved["base_url"] == "http://1.2.3.4:1234/v1"
     assert resolved["api_key"] == "local-provider-key"
     assert resolved["requested_provider"] == "local"
@@ -956,6 +957,7 @@ def test_named_custom_provider_filters_capabilities_at_lookup_boundary(monkeypat
             "providers": {
                 "local": {
                     "name": "Local",
+                    "transport": "codex_responses",
                     "base_url": "http://1.2.3.4:1234/v1",
                     "capabilities": {
                         "openai_native_compaction": True,

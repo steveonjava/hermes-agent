@@ -651,6 +651,7 @@ def build_anthropic_kwargs(
     reasoning_config: Optional[dict[str, Any]], tool_choice: Optional[str] = None,
     is_oauth: bool = False, preserve_dots: bool = False, context_length: Optional[int] = None,
     base_url: str | None = None, fast_mode: bool = False, drop_context_1m_beta: bool = False,
+    preserve_signed_thinking: bool = False,
 ) -> dict[str, Any]:
     """Build kwargs for anthropic.messages.create(). ``max_tokens`` is the OUTPUT cap for one
     response; ``context_length`` is the TOTAL window (input + output). ``max_tokens=None`` uses the
@@ -658,9 +659,11 @@ def build_anthropic_kwargs(
     clamped to ``context_length - 1``. The clamp ignores prompt size — callers must catch
     "max_tokens too large given prompt" and retry smaller (parse_available_output_tokens_from_error).
     ``is_oauth`` applies Claude Code compatibility transforms; ``preserve_dots`` keeps model-name
-    dots (DashScope: qwen3.5-plus); a third-party ``base_url`` strips thinking signatures;
+    dots (DashScope: qwen3.5-plus); unknown relays strip thinking unless
+    ``preserve_signed_thinking`` explicitly opts into native signed-block validation;
     ``fast_mode`` adds ``extra_body.speed="fast"`` plus the fast-mode beta on native Anthropic only."""
-    system, anthropic_messages = convert_messages_to_anthropic(messages, base_url=base_url, model=model)
+    system, anthropic_messages = convert_messages_to_anthropic(
+        messages, base_url=base_url, model=model, preserve_signed_thinking=preserve_signed_thinking)
     anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
     # Nous Portal routes on its own catalog ids (``anthropic/claude-opus-4.8``); normalizing would
     # make the model unresolvable there (prefix AND dots kept).

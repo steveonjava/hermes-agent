@@ -336,6 +336,7 @@ def _adopt_provider_context_limit(st: _Recovery, error_msg: str, old_ctx: int) -
             model=agent.model, context_length=new_ctx, base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
         )
+        compressor.capabilities = dict(getattr(agent, "capabilities", {}) or {})
         # Persist the provider-reported limit BEFORE compression/retry: rate limit,
         # missing usage, or restart must not lose confirmed metadata. Probe flags
         # remain a fallback if this write fails.

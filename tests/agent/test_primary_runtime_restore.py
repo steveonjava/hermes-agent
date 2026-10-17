@@ -845,6 +845,7 @@ class TestSwitchModelRequestOverridesSnapshot:
                 new_provider=kwargs.get("new_provider", "openai"),
                 base_url=kwargs.get("base_url", "https://api.openai.com/v1"),
                 api_key=kwargs.get("api_key", "test-key-12345678"),
+                api_mode=kwargs.get("api_mode", ""),
                 provider_capabilities=kwargs.get("provider_capabilities"),
                 runtime_capabilities=kwargs.get("runtime_capabilities"),
             )
@@ -863,10 +864,12 @@ class TestSwitchModelRequestOverridesSnapshot:
             new_model="gpt-5.6-sol-chatgpt-tier",
             new_provider="custom",
             base_url="",
+            api_mode="codex_responses",
             provider_capabilities={"openai_native_compaction": True},
             runtime_capabilities={"native_compaction": True},
         )
 
+        assert agent.api_mode == "codex_responses"
         assert agent.capabilities == {"openai_native_compaction": True}
         assert agent.runtime_capabilities == {"native_compaction": True}
         assert agent._primary_runtime["capabilities"] == {

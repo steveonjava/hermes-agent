@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from hermes_cli.route_identity import normalize_route_base_url
+from hermes_cli.provider_capabilities import validate_capabilities, configured_capability_wire
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("hermes_cli.config")
@@ -252,11 +253,11 @@ def _normalize_custom_provider_entry(
     if entry.get("models_discovered") is True or discovered:
         normalized["models_discovered"] = True
 
-    capabilities = entry.get("capabilities")
-    if isinstance(capabilities, dict):
-        _put("capabilities", {
-            key: value for key, value in capabilities.items()
-            if isinstance(key, str) and isinstance(value, bool)})
+    wire = configured_capability_wire(normalized)
+    _put("capabilities", validate_capabilities(entry.get("capabilities"), wire))
+    for model_id, model_config in models_dict.items():
+        if isinstance(model_config, dict):
+            validate_capabilities(model_config, configured_capability_wire(normalized, model_id))
 
     for field, ok in (
         ("context_length", lambda v: isinstance(v, int) and v > 0),
@@ -292,7 +293,7 @@ def _custom_provider_entry_to_provider_config(
     provider_entry: dict[str, Any] = {"api": normalized["base_url"]}
     for field in (
         "name", "api_key", "key_env", "key_cmd", "models", "models_discovered", "context_length",
-        "rate_limit_delay", "discover_models", "extra_body", "extra_headers",
+        "rate_limit_delay", "discover_models", "extra_body", "extra_headers", "capabilities",
         "session_affinity_header", "ssl_ca_cert", "ssl_verify", "catalog_provider"):
         if field in normalized:
             provider_entry[field] = normalized[field]
@@ -487,9 +488,30 @@ def normalize_extra_headers(extra_headers: Any) -> dict[str, str]:
 def get_custom_provider_extra_headers(
     base_url: str,
     custom_providers: Optional[list[dict[str, Any]]] = None,
-    config: Optional[dict[str, Any]] = None) -> dict[str, str]:
-    """``extra_headers`` of the first route-matching entry declaring any, else ``{}``.
-    SECURITY: values may carry credentials — callers must never log them."""
+    config: Optional[dict[str, Any]] = None,
+    *, requested_provider: str = "",
+) -> dict[str, str]:
+    """Selected named entry's headers, or URL-based headers for an unnamed route.
+
+    SECURITY: values may carry credentials - callers must never log them.
+    A selected entry with no headers must not borrow another account's headers.
+    """
+    if requested_provider and requested_provider not in ("custom", "auto"):
+        from hermes_cli.runtime_provider_custom import _get_named_custom_provider
+        named_config = config
+        if named_config is None and custom_providers is not None:
+            named_config = {
+                "providers": {entry["provider_key"]: entry for entry in custom_providers
+                              if isinstance(entry, dict) and entry.get("provider_key")},
+                "custom_providers": custom_providers,
+            }
+        selected = _get_named_custom_provider(
+            requested_provider, config=named_config, resolve_credentials=False,
+        )
+        if selected is not None:
+            return normalize_extra_headers(selected.get("extra_headers"))
+        if requested_provider.strip().lower().startswith("custom:"):
+            return {}
     for entry in _entries_for_route(base_url, custom_providers, config):
         headers = normalize_extra_headers(entry.get("extra_headers"))
         if headers:
@@ -501,10 +523,14 @@ def apply_custom_provider_extra_headers_to_client_kwargs(
     client_kwargs: dict[str, Any],
     base_url: str,
     custom_providers: Optional[list[dict[str, Any]]] = None,
-    config: Optional[dict[str, Any]] = None) -> None:
+    config: Optional[dict[str, Any]] = None,
+    *, requested_provider: str = "",
+) -> None:
     """Merge per-provider ``extra_headers`` onto OpenAI client ``default_headers`` (provider wins
     over SDK defaults, most specific level). SECURITY: values may carry credentials; never log."""
-    extra_headers = get_custom_provider_extra_headers(base_url, custom_providers, config)
+    extra_headers = get_custom_provider_extra_headers(
+        base_url, custom_providers, config, requested_provider=requested_provider,
+    )
     if not extra_headers:
         return
     merged = dict(client_kwargs.get("default_headers") or {})

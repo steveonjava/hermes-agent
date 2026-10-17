@@ -89,6 +89,7 @@ class _ModelSwitchContext:
     user_provs: Any = None
     custom_provs: Any = None
     excluded_provs: list = dataclasses.field(default_factory=list)
+    runtime_binding: Any = None
 
     def read_config(self) -> None:
         """Fill the current route from ``config_path``; fail-open to the defaults."""
@@ -118,11 +119,18 @@ class _ModelSwitchContext:
     def apply_override(self, override: dict) -> None:
         """A session /model override supersedes the configured route."""
         if override:
+            from hermes_cli.runtime_binding import parse_runtime_binding
+            binding = parse_runtime_binding(override.get("runtime_binding"))
+            if "runtime_binding" in override and binding is None:
+                raise ValueError("Invalid runtime binding metadata")
+            self.runtime_binding = binding
             self.current_model = override.get("model", self.current_model)
             self.current_provider = override.get("provider", self.current_provider)
             self.route_provider = override.get("provider", self.route_provider)
             self.current_base_url = override.get("base_url", self.current_base_url)
             self.current_api_key = override.get("api_key", self.current_api_key)
+            if binding is not None:
+                self.current_api_key = override.get("api_key") or ""
 
 
 
@@ -169,6 +177,7 @@ class GatewayModelCommandsMixin:
             current_api_key=ctx.current_api_key, is_global=ctx.persist_global,
             explicit_provider=explicit_provider, user_providers=ctx.user_provs,
             custom_providers=ctx.custom_provs,
+            **({"runtime_binding": ctx.runtime_binding} if getattr(ctx, "runtime_binding", None) is not None else {}),
         )
         if not result.success:
             return None, t("gateway.model.error_prefix", error=result.error_message)
@@ -193,8 +202,10 @@ class GatewayModelCommandsMixin:
         cached_agent = self._cached_agent_for(ctx.session_key)
         if cached_agent is None:
             return None
+        from hermes_cli.cli_model_switch_mixin import _binding_switch_kwargs
         try:
             cached_agent.switch_model(
+                **_binding_switch_kwargs(getattr(result, "runtime_binding", None)),
                 new_model=result.new_model, new_provider=result.target_provider,
                 api_key=result.api_key, base_url=result.base_url, api_mode=result.api_mode,
                 provider_capabilities=getattr(result, "provider_capabilities", None),
@@ -220,6 +231,8 @@ class GatewayModelCommandsMixin:
         """
         from hermes_cli.model_switch import format_model_for_display
 
+        from hermes_cli.runtime_binding import parse_runtime_binding, runtime_binding_state
+        binding = parse_runtime_binding(getattr(result, "runtime_binding", None))
         # Persist the new model to the session DB so the dashboard shows the updated model (#34850).
         _sess_db = getattr(self, "_session_db", None)
         if _sess_db is not None:  # so the dashboard shows the updated model
@@ -252,6 +265,8 @@ class GatewayModelCommandsMixin:
             "base_url": result.base_url, "api_mode": result.api_mode,
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.provider_capabilities or {}),
+            **({"runtime_binding": runtime_binding_state(binding),
+                "requested_provider": binding.requested_provider} if binding else {}),
         }
         if one_turn:
             # A repeated --once before the turn runs must keep the EARLIEST snapshot: the later

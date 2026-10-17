@@ -1499,7 +1499,8 @@ class MatrixAdapter(BasePlatformAdapter):
                 await client.crypto.share_keys()
             except Exception as exc:
                 logger.warning("Matrix: initial key share failed: %s", exc)
-        self._sync_task = asyncio.create_task(self._sync_loop())
+        from .recovery import start_sync_loop
+        self._sync_task = start_sync_loop(self)
         self._mark_connected()
         self._self_profile_task = asyncio.create_task(self._sync_self_profile())
         self._wire_plugin_handlers(self._client)  # plugin-registered native handlers
@@ -2024,8 +2025,15 @@ class MatrixAdapter(BasePlatformAdapter):
             caption, reply_to, metadata, is_voice, voice_metadata)
 
     async def _sync_loop(self) -> None:
+        from . import recovery
+
         client = self._client
-        next_batch = await client.sync_store.get_next_batch()  # resume from the initial sync
+        last_heartbeat = recovery.time.monotonic()
+        try:
+            next_batch = await client.sync_store.get_next_batch()  # resume from the initial sync
+        except Exception as exc:
+            logger.warning("Matrix: sync store read failed: %s", exc)
+            next_batch = None
         while not self._closing:
             try:
                 # 45s outer cap guards TCP-level hangs the 30s long-poll timeout cannot catch.
@@ -2043,6 +2051,7 @@ class MatrixAdapter(BasePlatformAdapter):
                         return
                 if isinstance(sync_data, dict):
                     next_batch = await self._absorb_sync(client, sync_data) or next_batch
+                    last_heartbeat = recovery.sync_heartbeat(last_heartbeat, len(self._joined_rooms))
                     await asyncio.sleep(0)  # let fresh invite joins start before the next sync
             except asyncio.CancelledError:
                 return
@@ -2111,6 +2120,8 @@ class MatrixAdapter(BasePlatformAdapter):
         client = self._client
         if not client or not hasattr(client, "handle_sync"):
             return
+        from .recovery import request_missing_room_keys
+        await request_missing_room_keys(client, sync_data)
         sas_tasks = await self._dispatch_sas_to_device_events(sync_data)
         tasks = client.handle_sync(sync_data)
         if inspect.isawaitable(tasks):
@@ -2128,7 +2139,13 @@ class MatrixAdapter(BasePlatformAdapter):
         """Decrypt and dispatch non-key Olm to-device events for SAS verification."""
         client = self._client
         crypto = getattr(client, "crypto", None)
-        raw_events = (sync_data.get("to_device") or {}).get("events") or []
+        try:
+            raw_events = (sync_data.get("to_device") or {}).get("events") or []
+            if raw_events:
+                iter(raw_events)
+        except Exception:
+            logger.warning("Matrix: Olm to-device preprocessing failed; continuing sync dispatch")
+            return []
         if crypto is None or not raw_events:
             return []
         try:
@@ -2145,22 +2162,22 @@ class MatrixAdapter(BasePlatformAdapter):
         remaining = []
         tasks = []
         for raw_event in raw_events:
-            if str(raw_event.get("type") or "") != "m.room.encrypted":
-                remaining.append(raw_event)
-                continue
             try:
+                if str(raw_event.get("type") or "") != "m.room.encrypted":
+                    remaining.append(raw_event)
+                    continue
                 event = ToDeviceEvent.deserialize(raw_event) if ToDeviceEvent else raw_event
                 decrypted = await crypto._decrypt_olm_event(event)
-            except Exception as exc:
-                logger.debug("Matrix: Olm to-device decrypt failed: %s", exc)
+                if decrypted.type == room_key:
+                    await crypto._receive_room_key(decrypted)
+                elif decrypted.type == forwarded_room_key:
+                    await crypto._receive_forwarded_room_key(decrypted)
+                else:
+                    tasks.extend(client.dispatch_event(decrypted, source=source) or [])
+            except Exception:
+                logger.warning("Matrix: Olm to-device preprocessing failed; continuing sync dispatch")
                 remaining.append(raw_event)
                 continue
-            if decrypted.type == room_key:
-                await crypto._receive_room_key(decrypted)
-            elif decrypted.type == forwarded_room_key:
-                await crypto._receive_forwarded_room_key(decrypted)
-            else:
-                tasks.extend(client.dispatch_event(decrypted, source=source) or [])
         (sync_data.get("to_device") or {})["events"] = remaining
         return tasks
 

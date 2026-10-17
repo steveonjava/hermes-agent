@@ -1012,6 +1012,9 @@ def recover_with_credential_pool(
     Rate limits: retry once, then rotate. Billing: rotate immediately. Auth: refresh before
     rotating. ``classified_reason`` beats raw HTTP codes (e.g. Anthropic 400 "out of extra
     usage"); ``billing_unverified`` gives the entry a short cooldown, not the one-hour bench."""
+    from hermes_cli.runtime_binding import allows_native_pool
+    if not allows_native_pool(getattr(agent, "runtime_binding", None)):
+        return False, has_retried_429
     pool = agent._credential_pool
     if pool is None:
         return False, has_retried_429
@@ -1136,6 +1139,9 @@ def recover_with_credential_pool(
 def _apply_primary_runtime_fields(agent, rt: dict[str, Any]) -> None:
     """Copy the identity/transport fields of a ``_primary_runtime`` snapshot onto ``agent``
     (shared by transport recovery and turn-start restore; the caller rebuilds the client)."""
+    from hermes_cli.runtime_binding import parse_runtime_binding
+    binding = parse_runtime_binding(rt.get("runtime_binding"))
+    agent.runtime_binding = binding
     agent.model = rt["model"]
     agent.provider = rt["provider"]
     agent.requested_provider = rt.get("requested_provider", agent.provider)
@@ -1288,14 +1294,27 @@ def drop_thinking_only_and_merge_users(
     return merged
 
 
+def _primary_selected_named_nonpool(agent) -> bool:
+    """Preserve a selected named runtime that had no pool when fallback began."""
+    if getattr(agent, "_primary_had_credential_pool", None) is not False:
+        return False
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+    rt = agent._primary_runtime or {}
+    identity = str(rt.get("requested_provider") or rt.get("provider") or "")
+    return _get_named_custom_provider(identity, resolve_credentials=False) is not None
+
+
 def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base_url, matches_primary, load_primary_pool):
     """Reset-aware gate: skip a guaranteed-to-fail restore while the primary pool reports a
     future reset; fails open on any error/None. Returns ``(blocked, prefetched_pool, prefetched)``
     so the rebind step reuses the loaded pool (one auth.json read at most)."""
     prefetched_pool, prefetched = None, False
+    from hermes_cli.runtime_binding import allows_native_pool
+    if not allows_native_pool((agent._primary_runtime or {}).get("runtime_binding")) or _primary_selected_named_nonpool(agent):
+        return False, prefetched_pool, prefetched
     try:
         pool = getattr(agent, "_credential_pool", None)
-        if not matches_primary(pool):
+        if (pool is None and getattr(agent, "_primary_had_credential_pool", None) is True) or not matches_primary(pool):
             prefetched_pool = pool = load_primary_pool()
             prefetched = True
         primary_model = str(rt.get("model") or "").strip()
@@ -1329,9 +1348,14 @@ def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matc
     fallback attaches its own pool, which would trip the provider-mismatch guard on the next
     401/429: reload the primary pool, else clear it. The snapshot api_key may be stale after
     rotation; re-select the pool's best entry, keeping the snapshot key when none is usable."""
+    from hermes_cli.runtime_binding import allows_native_pool
+    if not allows_native_pool((agent._primary_runtime or {}).get("runtime_binding")) or _primary_selected_named_nonpool(agent):
+        agent._credential_pool = None
+        agent._credential_pool_entry_id = None
+        return
     pool = getattr(agent, "_credential_pool", None)
     pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
-    if pool is not None and pool_provider and not matches_primary(pool):
+    if (pool is None and getattr(agent, "_primary_had_credential_pool", None) is True) or (pool_provider and not matches_primary(pool)):
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
         try:
@@ -1449,14 +1473,19 @@ def restore_primary_runtime(agent) -> bool:
         # that was never verified and re-fail every turn. Stay on the fallback.
         return False
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
+    pool_identity = (str((rt or {}).get("requested_provider") or primary_provider)
+                     if primary_provider == "custom" else primary_provider)
 
     def _matches_primary(candidate) -> bool:
-        return credential_pool_matches_provider(candidate, primary_provider, base_url=primary_runtime_base_url)
+        return credential_pool_matches_provider(candidate, pool_identity, base_url=primary_runtime_base_url)
 
     def _load_primary_pool():
         """Load the primary provider's pool; None when absent or provider-mismatched."""
         from agent.credential_pool import load_pool
-        key = resolve_runtime_pool_key(primary_provider, primary_runtime_base_url)
+        from hermes_cli.runtime_binding import allows_native_pool
+        if not allows_native_pool((agent._primary_runtime or {}).get("runtime_binding")) or _primary_selected_named_nonpool(agent):
+            return None
+        key = resolve_runtime_pool_key(pool_identity, primary_runtime_base_url)
         loaded = load_pool(key) if key else None
         return loaded if loaded is not None and _matches_primary(loaded) else None
     if _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool):
@@ -1617,7 +1646,11 @@ def _direct_native_anthropic_tool_cache_capability(
     """Return whether this resolved destination accepts native tool markers."""
     eff_base_url = base_url if base_url is not None else (agent.base_url or "")
     eff_api_mode = api_mode if api_mode is not None else (agent.api_mode or "")
-    return eff_api_mode == "anthropic_messages" and base_url_hostname(eff_base_url) == "api.anthropic.com"
+    if eff_api_mode != "anthropic_messages":
+        return False
+    if base_url_hostname(eff_base_url) == "api.anthropic.com":
+        return True
+    return (getattr(agent, "capabilities", {}) or {}).get("anthropic_tool_cache_marker") is True
 
 
 # The cache_ttl tiers accepted by config; mirrored by agent_init's live-agent snapshot.
@@ -2126,10 +2159,11 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
 
 # Pool reload is part of the switch and must be reversible on rollback, hence the pool fields.
 _SWITCH_SNAPSHOT_FIELDS = (
-    "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
+    "model", "provider", "requested_provider", "runtime_binding", "base_url", "api_mode", "api_key", "client",
     "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
     "_config_context_length", "_reasoning_echo_flag", "capabilities", "runtime_capabilities",
     "_credential_pool", "_credential_pool_entry_id",
+    "_use_prompt_caching", "_use_native_cache_layout",
     "_codex_reasoning_replay_enabled", "_codex_reasoning_replay_rejected",
 )
 _MISSING = object()
@@ -2154,7 +2188,7 @@ def _restore_switch_snapshot(agent, snapshot: dict[str, Any]) -> None:
 
 
 def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mode, capabilities,
-                                provider_capabilities, runtime_capabilities, old_norm, new_norm):
+                                provider_capabilities, runtime_capabilities, old_norm, new_norm, requested_provider=None):
     """Resolve ``(api_mode, base_url, provider, runtime capabilities)`` for the switch target."""
     from hermes_cli.providers import determine_api_mode, is_actual_route
     from agent.native_compaction import resolve_native_compaction_capabilities
@@ -2175,17 +2209,24 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
         if effective_base_url:
             from hermes_cli.auth import normalize_actual_base_url
             base_url = normalize_actual_base_url(effective_base_url)
-    destination_provider_capabilities = (
-        {key: value for key, value in provider_capabilities.items()
-         if isinstance(key, str) and isinstance(value, bool)}
-        if isinstance(provider_capabilities, dict) else {})
+    from hermes_cli.provider_capabilities import validate_capabilities, TRUST_WIRES
+    destination_provider_capabilities = validate_capabilities(provider_capabilities, api_mode)
+    legacy_trust = ({key: value for key, value in capabilities.items() if key in TRUST_WIRES}
+                    if provider_capabilities is None and isinstance(capabilities, dict) else {})
+    if legacy_trust:
+        destination_provider_capabilities = validate_capabilities(legacy_trust, api_mode)
     supplied_runtime_capabilities = None
     if isinstance(runtime_capabilities, dict):
         supplied_runtime_capabilities = dict(runtime_capabilities)
     elif provider_capabilities is None and isinstance(capabilities, dict):
         supplied_runtime_capabilities = dict(capabilities)
-        if old_norm == new_norm:
+        if (old_norm == new_norm and not legacy_trust
+                and effective_base_url == getattr(agent, "base_url", "")
+                and api_mode == getattr(agent, "api_mode", "")
+                and (requested_provider is None or requested_provider == getattr(agent, "requested_provider", None))):
             destination_provider_capabilities = dict(getattr(agent, "capabilities", {}) or {})
+        if legacy_trust.get("openai_native_compaction") is True:
+            supplied_runtime_capabilities.setdefault("native_compaction", True)
     resolved_route_capabilities = resolve_native_compaction_capabilities(
         model=new_model, base_url=effective_base_url, provider=new_provider,
         is_codex_backend=new_norm == "openai-codex",
@@ -2282,12 +2323,21 @@ def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new
     agent.client = agent._create_openai_client(dict(agent._client_kwargs), reason="switch_model", shared=True)
 
 
-def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm) -> None:
+def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm,
+                         requested_provider=None) -> None:
     """Swap identity/transport fields, reload the pool, rebuild the client (rolled back by the caller on error)."""
     # Clear the per-config override so the new model's context window is re-resolved.
     agent._config_context_length = None
     agent.model = new_model
-    agent.provider = agent.requested_provider = new_provider
+    old_requested = getattr(agent, "requested_provider", None)
+    if not isinstance(old_requested, str) or not old_requested:
+        old_requested = old_provider
+    agent.provider = new_provider
+    from hermes_cli.route_identity import normalize_route_base_url
+    same_destination = (normalize_route_base_url(base_url or agent.base_url)
+                        == normalize_route_base_url(agent.base_url))
+    agent.requested_provider = requested_provider or (
+        old_requested if new_norm == old_norm == "custom" and same_destination else new_provider)
     # Re-read reasoning_echo so the flag reflects the new primary model (see _reasoning_echo_opt_in).
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
     # Empty base_url while the provider changes means upstream resolution failed; falling back to
@@ -2311,13 +2361,28 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
         agent.api_key = api_key
     # Reload the credential pool on provider change: a pool with a mismatched provider makes
     # recover_with_credential_pool short-circuit. Reload failure is non-fatal.
-    if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
+    from hermes_cli.runtime_binding import allows_native_pool
+    pool_allowed = allows_native_pool(getattr(agent, "runtime_binding", None))
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider
+    if (agent.requested_provider.strip().lower().startswith("custom:")
+            and _get_named_custom_provider(agent.requested_provider, resolve_credentials=False) is None):
+        pool_allowed = False
+    if not pool_allowed:
+        agent._credential_pool = None
+        agent._credential_pool_entry_id = None
+    if pool_allowed and (old_norm != new_norm or old_requested != agent.requested_provider
+            or getattr(agent, "_credential_pool", None) is None):
         # A pool bound to the old provider is worse than none: the recovery guard rejects it.
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
         try:
             from agent.credential_pool import load_pool
-            agent._credential_pool = load_pool(new_provider)
+            pool_identity = agent.requested_provider if new_norm == "custom" else new_provider
+            pool_key = (pool_identity if pool_identity.startswith("custom:")
+                        else resolve_runtime_pool_key(pool_identity, agent.base_url))
+            agent._credential_pool = load_pool(pool_key)
+            if not credential_pool_matches_provider(agent._credential_pool, pool_identity, base_url=agent.base_url):
+                agent._credential_pool = None
         except Exception as _pool_exc:
             logger.warning(
                 "switch_model: credential pool reload failed for %s (%s); "
@@ -2381,6 +2446,7 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
     # agent.api_key may be a callable (Azure Foundry Entra ID); get_model_context_length expects a
     # string for live probes, so coerce defensively.
     ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+    compressor_state = vars(agent.context_compressor).copy()
     try:
         new_context_length = get_model_context_length(
             agent.model, base_url=agent.base_url, api_key=ctx_api_key, provider=agent.provider,
@@ -2394,7 +2460,10 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
+        agent.context_compressor.capabilities = dict(getattr(agent, "capabilities", {}) or {})
     except Exception:
+        vars(agent.context_compressor).clear()
+        vars(agent.context_compressor).update(compressor_state)
         _restore_switch_snapshot(agent, snapshot)
         raise
     # Outside the rollback guard: a probe hiccup must not undo a good switch. Eager, so the aux
@@ -2410,6 +2479,7 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
         "model": agent.model,
         "provider": agent.provider,
         "requested_provider": agent.requested_provider,
+        "runtime_binding": getattr(agent, "runtime_binding", None),
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
@@ -2483,12 +2553,20 @@ def _persist_switch_billing_route(agent) -> None:
 
 def switch_model(
     agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None,
-    provider_capabilities=None, runtime_capabilities=None,
+    provider_capabilities=None, runtime_capabilities=None, requested_provider=None, runtime_binding=None,
 ):
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
     the change persists across turns. A failed swap/rebuild rolls back to the pre-switch
     snapshot and re-raises (callers catch)."""
+    from hermes_cli.runtime_binding import parse_runtime_binding
+    runtime_binding = parse_runtime_binding(runtime_binding)
+    from hermes_cli.runtime_provider_custom import _validate_runtime_binding
+    if runtime_binding is not None:
+        _validate_runtime_binding(runtime_binding, new_provider, requested_provider or new_provider)
+        requested_provider = runtime_binding.requested_provider
+        if runtime_binding.credential_policy == "key_override" and not api_key:
+            raise ValueError("Pinned runtime credential unavailable; re-supply the API key")
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
@@ -2501,12 +2579,14 @@ def switch_model(
     new_norm = (new_provider or "").strip().lower()
     api_mode, base_url, destination_provider_capabilities, destination_runtime_capabilities = _resolve_switch_destination(
         agent, new_model, new_provider, base_url, api_mode, capabilities,
-        provider_capabilities, runtime_capabilities, old_norm, new_norm
+        provider_capabilities, runtime_capabilities, old_norm, new_norm, requested_provider
     )
     snapshot = _snapshot_switch_state(agent)
     try:
+        agent.runtime_binding = runtime_binding
         _swap_switch_runtime(
-            agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm
+            agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm,
+            requested_provider=requested_provider,
         )
     except Exception:
         _restore_switch_snapshot(agent, snapshot)
@@ -2516,6 +2596,9 @@ def switch_model(
     # sees flags added to config.yaml after session start.
     if custom_providers is not None:
         agent._custom_providers = custom_providers
+    # Destination consumers must see the new trust; rebuild failures restore the snapshot.
+    agent.capabilities = destination_provider_capabilities
+    agent.runtime_capabilities = destination_runtime_capabilities
     agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
         provider=new_provider, base_url=agent.base_url, api_mode=api_mode, model=new_model
     )
@@ -2534,10 +2617,6 @@ def switch_model(
         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
     # Invalidate the cached system prompt so it rebuilds next turn.
     agent._cached_system_prompt = None
-    # Publish the destination capability map only after every runtime setup above has succeeded.
-    # Failed switches must leave the old map intact.
-    agent.capabilities = destination_provider_capabilities
-    agent.runtime_capabilities = destination_runtime_capabilities
     # Reset the cross-turn stale-call circuit breaker; otherwise the latched streak keeps
     # short-circuiting the freshly selected healthy provider.
     from agent.chat_completion_helpers import _reset_stale_streak

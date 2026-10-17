@@ -1676,6 +1676,7 @@ def _cap_long_context_tier(agent: Any) -> int:
             model=agent.model, context_length=_LONG_CONTEXT_TIER_CAP, base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
         )
+        compressor.capabilities = dict(getattr(agent, "capabilities", {}) or {})
         # Context probing flags exist only on the built-in compressor (plugin engines
         # manage their own). Don't persist — a tier limit, not a model capability;
         # 1M should return if extra usage is enabled.

@@ -240,24 +240,29 @@ class SessionPersistenceMixin:
         loader = self._routing_db_method("load_gateway_routing_entries")
         if loader is None:
             return False
+        from gateway.session import InvalidModelOverrideBinding
         try:
             for key, entry_json in loader(scope=self._routing_scope()).items():
                 entry = self._routing_entry_from_json(key, entry_json)
                 if entry is not None:
                     self._entries[key] = entry
             return True
+        except InvalidModelOverrideBinding:
+            raise
         except Exception as e:
             logger.warning("gateway.session: state.db routing load failed: %s", e)
             return False
 
     @staticmethod
     def _routing_entry_from_json(key: str, entry_json: str) -> Optional[SessionEntry]:
-        """Parse one gateway_routing row; None (with a warning) when invalid."""
-        from gateway.session import SessionEntry
+        """Skip unrelated corrupt rows, but never erase invalid present route authority."""
+        from gateway.session import InvalidModelOverrideBinding, SessionEntry
         try:
             entry_data = json.loads(entry_json)
             if isinstance(entry_data, dict):
                 return SessionEntry.from_dict(entry_data)
+        except InvalidModelOverrideBinding:
+            raise
         except (ValueError, KeyError, TypeError) as e:
             logger.warning("Skipping invalid routing entry %r: %s", key, e)
         return None
@@ -285,7 +290,7 @@ class SessionPersistenceMixin:
 
     def _import_legacy_sessions_json(self, db_had_entries: bool) -> None:
         """Legacy import: sessions.json fills only keys the DB lacks. Lock held."""
-        from gateway.session import SessionEntry
+        from gateway.session import InvalidModelOverrideBinding, SessionEntry
         sessions_file = self.sessions_dir / "sessions.json"
         if not sessions_file.exists():
             return
@@ -305,12 +310,16 @@ class SessionPersistenceMixin:
                 try:
                     self._entries[key] = SessionEntry.from_dict(entry_data)
                     imported += 1
+                except InvalidModelOverrideBinding:
+                    raise
                 except (ValueError, KeyError, TypeError) as e:
                     logger.warning("Skipping invalid session entry %r: %s", key, e)
             if imported and db_had_entries:
                 logger.info(
                     "gateway.session: imported %d legacy sessions.json entr%s missing from "
                     "state.db routing table", imported, "y" if imported == 1 else "ies")
+        except InvalidModelOverrideBinding:
+            raise
         except Exception as e:
             print(f"[gateway] Warning: Failed to load sessions: {e}")
 

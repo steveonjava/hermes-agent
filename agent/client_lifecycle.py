@@ -568,6 +568,9 @@ class ClientLifecycleMixin:
         return self._replace_primary_openai_client(reason=reason)
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
+        from hermes_cli.runtime_binding import allows_credential_refresh
+        if not allows_credential_refresh(getattr(self, "runtime_binding", None)):
+            return False
         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
             return False
         # No silent account swap: a non-singleton credential (manual pool entry, explicit api_key=) must not be
@@ -606,6 +609,9 @@ class ClientLifecycleMixin:
 
     def _try_refresh_nous_client_credentials(self, *, force: bool = True, require_account: str | None = None) -> bool:
         # Portal serves anthropic/* on the native Messages route, so either client kind may hold the expiring JWT.
+        from hermes_cli.runtime_binding import allows_credential_refresh
+        if not allows_credential_refresh(getattr(self, "runtime_binding", None)):
+            return False
         if self.provider != "nous" or self.api_mode not in ("chat_completions", "anthropic_messages"):
             return False
         try:
@@ -725,6 +731,9 @@ class ClientLifecycleMixin:
                 return None
             # Custom providers pin base_url in config, so only key edits are adopted here.
             base_url = default_base = str(custom_provider.get("base_url") or "").strip().rstrip("/")
+            binding = getattr(self, "runtime_binding", None)
+            if binding is not None and binding.credential_policy == "route_override":
+                base_url = default_base = self.base_url
         else:
             return None
         if not base_url:
@@ -756,6 +765,9 @@ class ClientLifecycleMixin:
         latter resolve to ``provider="custom"`` with no registry entry, so they are matched through the
         runtime provider's config lookup instead.
         """
+        from hermes_cli.runtime_binding import allows_credential_refresh
+        if not allows_credential_refresh(getattr(self, "runtime_binding", None)):
+            return False
         if self.api_mode != "chat_completions" or getattr(self, "_fallback_activated", False):
             return False
         resolved = self._resolve_env_credentials()
@@ -791,6 +803,9 @@ class ClientLifecycleMixin:
 
     def _try_refresh_vertex_client_credentials(self) -> bool:
         """Re-mint the Vertex OAuth2 token (~1h TTL; long sessions 401 on the expired bearer) and rebuild the client."""
+        from hermes_cli.runtime_binding import allows_credential_refresh
+        if not allows_credential_refresh(getattr(self, "runtime_binding", None)):
+            return False
         if self.api_mode != "chat_completions" or self.provider != "vertex":
             return False
         try:
@@ -820,6 +835,9 @@ class ClientLifecycleMixin:
         The raw GitHub token is stable; the short-TTL *exchanged* IDE token is what expires mid-turn (``401 IDE
         token expired``), so force a fresh exchange rather than re-resolving the raw token.
         """
+        from hermes_cli.runtime_binding import allows_credential_refresh
+        if not allows_credential_refresh(getattr(self, "runtime_binding", None)):
+            return False
         if not self._is_copilot_provider():
             return False
         try:
@@ -881,6 +899,9 @@ class ClientLifecycleMixin:
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
         # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.
+        from hermes_cli.runtime_binding import allows_credential_refresh
+        if not allows_credential_refresh(getattr(self, "runtime_binding", None)):
+            return False
         anthropic_base_url = getattr(self, "_anthropic_base_url", "") or ""
         if (
             self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key")
@@ -956,7 +977,10 @@ class ClientLifecycleMixin:
         if self.api_mode not in ("anthropic_messages", "bedrock_converse"):
             try:
                 from hermes_cli.config import apply_custom_provider_extra_headers_to_client_kwargs
-                apply_custom_provider_extra_headers_to_client_kwargs(self._client_kwargs, base_url)
+                apply_custom_provider_extra_headers_to_client_kwargs(
+                    self._client_kwargs, base_url,
+                    requested_provider=getattr(self, "requested_provider", "") or getattr(self, "provider", ""),
+                )
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)
 

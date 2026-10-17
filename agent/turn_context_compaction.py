@@ -94,6 +94,7 @@ def _apply_grown_window(agent: Any, compressor: Any, grown: int) -> None:
         provider=getattr(agent, "provider", "") or "",
         api_mode=getattr(agent, "api_mode", "") or "",
     )
+    compressor.capabilities = dict(getattr(agent, "capabilities", {}) or {})
     agent._buffer_status(
         f"📈 Context window grown to {grown // 1024}K "
         f"(local model; conversation continues uncompressed)"

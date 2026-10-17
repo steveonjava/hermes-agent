@@ -2678,6 +2678,8 @@ class ContextCompressor(
         """Update model info after a model switch or fallback activation."""
         runtime_changed = (model, provider, base_url, api_mode) != (self.model, self.provider, self.base_url, self.api_mode)
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
+        if runtime_changed:
+            self.capabilities = {}
         self.context_length = context_length
         # max_tokens=None means "unspecified": keep the existing output reservation.
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
@@ -5039,6 +5041,12 @@ Write only the summary body. Do not include any preamble or prefix."""
     def _stale_thinking_on_wire(self) -> bool:
         """Whether the route replays stale thinking every turn; tail walks and preflight MUST agree or compaction loops."""
         try:
+            from agent.anthropic_thinking_policy import native_anthropic_preserves_prior_thinking
+            if getattr(self, "api_mode", "") == "anthropic_messages" and native_anthropic_preserves_prior_thinking(
+                getattr(self, "base_url", ""), getattr(self, "model", ""),
+                preserve_signed_thinking=(getattr(self, "capabilities", {}) or {}).get("anthropic_signed_thinking") is True,
+            ):
+                return True
             from agent.message_sanitization import stale_thinking_reaches_wire
             return stale_thinking_reaches_wire(
                 *(getattr(self, attr, "") or "" for attr in ("api_mode", "provider", "model", "base_url"))
@@ -5053,7 +5061,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         from agent.anthropic_thinking_policy import native_anthropic_preserves_prior_thinking
 
         if (getattr(self, "api_mode", "") or "") != "anthropic_messages" or not native_anthropic_preserves_prior_thinking(
-            getattr(self, "base_url", ""), getattr(self, "model", "")
+            getattr(self, "base_url", ""), getattr(self, "model", ""),
+            preserve_signed_thinking=(getattr(self, "capabilities", {}) or {}).get("anthropic_signed_thinking") is True,
         ):
             return None
         from agent.anthropic_thinking_replay import session_rejected_thinking, strip_rejected_thinking

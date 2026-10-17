@@ -14,7 +14,7 @@ from hermes_state import SessionDB
 
 
 def _mock_agent():
-    return MagicMock(name="MockAIAgent")
+    return MagicMock(name="MockAIAgent", runtime_binding=None)
 
 
 @pytest.fixture()

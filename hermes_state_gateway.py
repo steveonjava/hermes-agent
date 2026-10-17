@@ -818,12 +818,18 @@ class SessionGatewayMixin:
                 raw = {}
         if not isinstance(raw, dict):
             raw = {}
+        from hermes_cli.runtime_binding import runtime_binding_state
         runtime = raw.get("gateway_runtime")
+        for record in (raw, runtime):
+            if isinstance(record, dict) and "runtime_binding" in record:
+                if record["runtime_binding"] is None:
+                    raise ValueError("Invalid runtime binding metadata")
+                record["runtime_binding"] = runtime_binding_state(record["runtime_binding"])
         # Filter None: the persist path writes or-None to trigger deletion in the top-level
         # merge, but gateway_runtime is replaced whole (not deep-merged), so None survives here.
         if isinstance(runtime, dict) and runtime.get("provider"):
             return {k: v for k, v in runtime.items() if v is not None}
-        top_level = {key: raw.get(key) for key in ("provider", "base_url", "api_mode") if raw.get(key)}
+        top_level = {key: raw.get(key) for key in ("provider", "base_url", "api_mode", "runtime_binding") if raw.get(key)}
         # billing_provider is COALESCE-written on the first accounted API call — the only durable
         # record for sessions that never ran /model. Bare buckets ("auto"/"custom") are not
         # routable identities; filter them so resume falls back to the ambient default.

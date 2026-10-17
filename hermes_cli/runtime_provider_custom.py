@@ -12,6 +12,7 @@ import os
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
+from hermes_cli.provider_capabilities import validate_capabilities, configured_capability_wire
 from agent.secret_scope import get_secret_str
 from utils import base_url_hostname
 
@@ -28,6 +29,34 @@ def _rp():
 
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
+
+
+def _binding_identity(value: str) -> tuple[str, str]:
+    """Resolve selection aliases without reading credentials."""
+    from hermes_cli.providers import normalize_provider
+    name = (value or "").strip().lower()
+    entry = _get_named_custom_provider(name, resolve_credentials=False)
+    if entry is not None:
+        return "custom", "custom:" + _normalize_custom_provider_name(entry.get("provider_key") or entry["name"])
+    if name in _DIRECT_API_BASE_URLS:
+        return "custom", "custom"
+    return normalize_provider(name), name
+
+
+def _validate_runtime_binding(value, provider: str, requested_provider: str):
+    from hermes_cli.runtime_binding import parse_runtime_binding
+    binding = parse_runtime_binding(value)
+    if binding is None:
+        return None
+    expected_provider, expected_name = _binding_identity(binding.requested_provider)
+    actual_provider, actual_name = _binding_identity(requested_provider)
+    from hermes_cli.providers import normalize_provider
+    if (normalize_provider(binding.provider) != expected_provider
+            or normalize_provider(provider) != expected_provider
+            or actual_provider != expected_provider
+            or (actual_name != expected_name and normalize_provider(actual_name) != normalize_provider(expected_name))):
+        raise ValueError("Contradictory runtime binding metadata")
+    return binding
 
 
 def _normalize_base_url_for_match(value) -> str:
@@ -75,18 +104,17 @@ def _entry_url(entry: dict[str, Any]) -> str:
 
 def _filter_capabilities(value: Any) -> dict[str, bool]:
     """Return the string-keyed boolean capabilities accepted at runtime."""
-    if not isinstance(value, dict):
-        return {}
-    return {k: v for k, v in value.items() if isinstance(k, str) and isinstance(v, bool)}
+    return validate_capabilities(value)
 
 
 def _lift_model_capabilities(entry: dict[str, Any], model: Optional[str], result: dict[str, Any]) -> None:
     """Copy explicit boolean per-model capabilities into the runtime."""
-    capabilities = _filter_capabilities(entry.get("capabilities"))
+    wire = configured_capability_wire(entry, model)
+    capabilities = validate_capabilities(entry.get("capabilities"), wire)
     models = entry.get("models")
     model_config = models.get(model) if isinstance(models, dict) and model else None
     if isinstance(model_config, dict):
-        capabilities.update(_filter_capabilities(model_config))
+        capabilities.update(validate_capabilities(model_config, wire))
     if capabilities:
         result["capabilities"] = capabilities
 
@@ -113,6 +141,9 @@ def _lift_common_custom_fields(entry: dict[str, Any], result: dict[str, Any], *,
     if api_mode:
         result["api_mode"] = api_mode
 
+    # Keep flat model metadata for the selected-model lift; never mutate config.
+    if isinstance(entry.get("models"), dict):
+        result["models"] = dict(entry["models"])
     _lift_model_capabilities(entry, None, result)
 
 
@@ -493,22 +524,24 @@ def expand_direct_api_alias(provider: Optional[str], existing_base: Optional[str
 
 
 def _resolve_direct_alias_runtime(requested_provider: str, explicit_api_key: Optional[str],
-                                  explicit_base_url: str) -> dict[str, Any]:
+                                  explicit_base_url: str, runtime_binding=None) -> dict[str, Any]:
     """Bare ``custom`` + explicit base_url (e.g. a ``model_aliases:`` direct alias)."""
     rp = _rp()
     base_url = explicit_base_url.strip().rstrip("/")
     # Pool first — mirrors the named-custom path so bare `provider: custom` with a configured
     # custom_providers entry gets its api_key from the pool instead of env fallbacks.
-    pool_result = rp._try_resolve_from_custom_pool(base_url, "custom", None)
+    from hermes_cli.runtime_binding import allows_native_pool
+    pool_result = None if explicit_api_key or not allows_native_pool(runtime_binding) else rp._try_resolve_from_custom_pool(base_url, "custom", None)
     if pool_result:
         pool_result["source"] = "direct-alias"
         return pool_result
     # OLLAMA_API_KEY gets its own gate here: without it a `model_aliases:` entry pointing at
     # Ollama Cloud resolved no key at all.
     # ``model.key_env`` only when this alias endpoint IS the configured model.base_url (#67453).
-    candidates = [(explicit_api_key or "").strip(), _model_cfg_key_env_for(rp._get_model_config(), base_url),
+    explicit_key = explicit_api_key if callable(explicit_api_key) else (explicit_api_key or "").strip()
+    candidates = [explicit_key, _model_cfg_key_env_for(rp._get_model_config(), base_url),
                   *rp._host_gated_env_key_candidates(base_url, ollama=True)]
-    api_key = next((c for c in candidates if rp.has_usable_secret(c)), "")
+    api_key = explicit_key if callable(explicit_key) else next((c for c in candidates if rp.has_usable_secret(c)), "")
     return _custom_runtime(rp, base_url, api_key, None, source="direct-alias", requested_provider=requested_provider)
 
 
@@ -532,7 +565,7 @@ def _opencode_family_for_custom(requested_provider: str, base_url: str) -> Optio
 
 def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: Optional[str] = None,
                                   explicit_base_url: Optional[str] = None,
-                                  target_model: Optional[str] = None) -> Optional[dict[str, Any]]:
+                                  target_model: Optional[str] = None, runtime_binding=None) -> Optional[dict[str, Any]]:
     """Runtime for a llamacpp alias, a bare-custom direct alias, or a configured custom entry.
     Aliases resolving to "custom" (ollama, vllm, llamacpp, …) are treated like bare ``custom``. A
     llamacpp alias with no explicit base_url resolves to the managed server first; an explicit
@@ -552,41 +585,41 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
     if requested_norm and requested_norm != "custom" and rp._resolves_to_custom(requested_norm):
         requested_norm = "custom"
     if requested_norm == "custom" and explicit_base_url:
-        return _resolve_direct_alias_runtime(requested_provider, explicit_api_key, explicit_base_url)
+        return _resolve_direct_alias_runtime(requested_provider, explicit_api_key, explicit_base_url, runtime_binding)
     custom_provider = custom_provider or rp._get_named_custom_provider(requested_provider)
     if not custom_provider:
         return None
     base_url = ((explicit_base_url or "").strip() or custom_provider.get("base_url", "")).rstrip("/")
     if not base_url:
         return None
-    pool_result = rp._try_resolve_from_custom_pool(
+    from hermes_cli.runtime_binding import allows_native_pool
+    pool_result = None if explicit_api_key or explicit_base_url or not allows_native_pool(runtime_binding) else rp._try_resolve_from_custom_pool(
         base_url, "custom", custom_provider.get("api_mode"),
         provider_name=custom_provider.get("provider_key") or custom_provider.get("name"),
     )
     if pool_result:
-        # The pool doesn't know the custom_providers fields — propagate them here too.
-        _apply_custom_provider_extras(custom_provider, target_model, pool_result)
-        return pool_result
-    explicit_key = (explicit_api_key or "").strip()
-    candidates = [
-        explicit_key,
-        _clean(custom_provider.get("api_key", "")),
-        _key_env_secret(custom_provider, f"custom provider '{custom_provider.get('name', requested_provider)}'"),
-        *rp._host_gated_env_key_candidates(base_url, ollama=False),
-    ]
-    api_key: Any = next((c for c in candidates if rp.has_usable_secret(c)), "")
-    # ``key_cmd`` credentials are minted per request (short-lived bearers would go stale
-    # mid-session); both wire clients accept a callable api_key (the Entra ID contract). An
-    # explicit --api-key still wins as the one-off recovery escape hatch.
-    key_cmd = _clean(custom_provider.get("key_cmd", ""))
-    if key_cmd and not rp.has_usable_secret(explicit_key):
-        from agent.command_token_source import build_command_token_provider
-        token_provider = build_command_token_provider(key_cmd, str(custom_provider.get("name", requested_provider) or "custom"))
-        if token_provider is not None:
-            api_key = token_provider
-    result = _custom_runtime(rp, base_url, api_key, custom_provider.get("api_mode"),
-                             source=f"custom_provider:{custom_provider.get('name', requested_provider)}",
-                             requested_provider=requested_provider)
+        result = pool_result
+    else:
+        explicit_key = explicit_api_key if callable(explicit_api_key) else (explicit_api_key or "").strip()
+        candidates = [
+            explicit_key,
+            _clean(custom_provider.get("api_key", "")),
+            _key_env_secret(custom_provider, f"custom provider '{custom_provider.get('name', requested_provider)}'"),
+            *rp._host_gated_env_key_candidates(base_url, ollama=False),
+        ]
+        api_key: Any = explicit_key if callable(explicit_key) else next((c for c in candidates if rp.has_usable_secret(c)), "")
+        # ``key_cmd`` credentials are minted per request (short-lived bearers would go stale
+        # mid-session); both wire clients accept a callable api_key (the Entra ID contract). An
+        # explicit --api-key still wins as the one-off recovery escape hatch.
+        key_cmd = _clean(custom_provider.get("key_cmd", ""))
+        if key_cmd and not callable(explicit_key) and not rp.has_usable_secret(explicit_key):
+            from agent.command_token_source import build_command_token_provider
+            token_provider = build_command_token_provider(key_cmd, str(custom_provider.get("name", requested_provider) or "custom"))
+            if token_provider is not None:
+                api_key = token_provider
+        result = _custom_runtime(rp, base_url, api_key, custom_provider.get("api_mode"),
+                                 source=f"custom_provider:{custom_provider.get('name', requested_provider)}",
+                                 requested_provider=requested_provider)
     _apply_custom_provider_extras(custom_provider, target_model, result)
     # OpenCode-family custom providers (opencode-go/zen names, or opencode.ai hosts) serve models
     # on different API surfaces — a static api_mode 503s for /v1/responses-only models. Re-derive
@@ -598,4 +631,5 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
         if effective_model:
             result["api_mode"] = opencode_model_api_mode(family, effective_model)
         result["base_url"] = normalize_opencode_base_url(family, result["api_mode"], result["base_url"])
+    validate_capabilities(result.get("capabilities"), result.get("api_mode") or configured_capability_wire(custom_provider, target_model))
     return result

@@ -17,10 +17,17 @@ _RUNTIME_KEYS = ("model", "provider", "api_key", "base_url", "api_mode")
 
 def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
+    # An active fallback's live pool does not describe the primary's departure.
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
+            "requested_provider": getattr(agent, "requested_provider", None),
+            "runtime_binding": getattr(agent, "runtime_binding", None),
             "provider_capabilities": copy.deepcopy(getattr(agent, "capabilities", {}) or {}),
             "runtime_capabilities": copy.deepcopy(getattr(agent, "runtime_capabilities", {}) or {}),
             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
+            "primary_had_credential_pool": (
+                getattr(agent, "_primary_had_credential_pool", None)
+                if getattr(agent, "_fallback_activated", False)
+                else getattr(agent, "_credential_pool", None) is not None),
             "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None))}
 
 
@@ -36,23 +43,30 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
             agent._primary_runtime = copy.deepcopy(primary)
+            if "primary_had_credential_pool" in snapshot:
+                agent._primary_had_credential_pool = snapshot["primary_had_credential_pool"]
             agent._fallback_activated = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
                 if "reasoning_config" in snapshot:
                     agent.reasoning_config = snapshot["reasoning_config"]
+                agent._one_turn_runtime_restore = None
                 return
         except Exception:
             logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
     if hasattr(agent, "switch_model"):
         model, provider, api_key, base_url, api_mode = (snapshot.get(k, "") for k in _RUNTIME_KEYS)
+        from hermes_cli.cli_model_switch_mixin import _binding_switch_kwargs
         agent.switch_model(
+            **(_binding_switch_kwargs(snapshot.get("runtime_binding")) or
+               ({"requested_provider": snapshot["requested_provider"]} if snapshot.get("requested_provider") else {})),
             new_model=model, new_provider=provider, api_key=api_key, base_url=base_url,
             api_mode=api_mode,
             provider_capabilities=snapshot.get("provider_capabilities"),
             runtime_capabilities=snapshot.get("runtime_capabilities"))
         if "reasoning_config" in snapshot:
             agent.reasoning_config = snapshot["reasoning_config"]
+        agent._one_turn_runtime_restore = None
 
 
 def _profile_runtime_scope_tokens(profile_home, *, hydrate_secrets: bool = True) -> _TurnScopes:
@@ -283,8 +297,10 @@ def _expensive_model_confirm(result, current_base_url: str, current_api_key, age
 
 def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot):
     """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts."""
+    from hermes_cli.cli_model_switch_mixin import _binding_switch_kwargs
     try:
         agent.switch_model(
+            **_binding_switch_kwargs(getattr(result, "runtime_binding", None)),
             new_model=result.new_model, new_provider=result.target_provider,
             api_key=result.api_key, base_url=result.base_url, api_mode=result.api_mode,
             provider_capabilities=getattr(result, "provider_capabilities", None),
@@ -300,12 +316,15 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
         raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                          f"staying on {getattr(agent, 'model', current_model)}.") from exc
     _restart_slash_worker(sid, session)
-    _persist_live_session_runtime(session)
-    _persist_live_session_system_prompt(session)
+    if snapshot is None:
+        agent._one_turn_runtime_restore = None
+        _persist_live_session_runtime(session)
+        _persist_live_session_system_prompt(session)
     _append_model_switch_marker(session, model=result.new_model, provider=result.target_provider)
     _emit_session_info(sid, session)
     if snapshot is not None:
-        session["one_turn_model_restore"] = snapshot
+        standing = session.setdefault("one_turn_model_restore", snapshot)
+        agent._one_turn_runtime_restore = standing
     else:
         session.pop("one_turn_model_restore", None)
 
@@ -317,6 +336,7 @@ def _apply_model_switch(
     """``count_switch=False``: an internal swap (config adoption, MoA one-shot and its restore), not a
     user's /model pick, so it stays out of the shared-metrics switch count."""
     from hermes_cli.model_switch import switch_model
+    from hermes_cli.runtime_binding import parse_runtime_binding, runtime_binding_state
     model_input, explicit_provider, one_turn, persist_global, reasoning_effort = _switch_request(
         raw_input, parsed_flags, persist_override)
     agent = session.get("agent")
@@ -324,6 +344,16 @@ def _apply_model_switch(
         raise ValueError("/model --once requires a live session")
     current_provider, current_model, current_base_url, current_api_key = _current_model_runtime(
         agent, explicit_provider)
+    current_binding = parse_runtime_binding(getattr(agent, "runtime_binding", None)) if agent else None
+    override = session.get("model_override")
+    if agent is None and isinstance(override, dict) and "runtime_binding" in override:
+        current_binding = parse_runtime_binding(override["runtime_binding"])
+        if current_binding is None:
+            raise ValueError("Invalid runtime binding metadata")
+        current_provider = override.get("provider") or current_binding.requested_provider
+        current_model = override.get("model") or current_model
+        current_base_url = override.get("base_url") or ""
+        current_api_key = override.get("api_key") or ""
     current_provider_capabilities = dict(getattr(agent, "capabilities", {}) or {}) if agent else {}
     # User-defined providers let switch_model resolve named custom endpoints
     # (e.g. "ollama-launch") and validate against saved model lists.
@@ -338,9 +368,11 @@ def _apply_model_switch(
         current_base_url=current_base_url, current_api_key=current_api_key,
         current_provider_capabilities=current_provider_capabilities, is_global=persist_global,
         explicit_provider=explicit_provider, user_providers=user_provs,
-        custom_providers=custom_provs)
+        custom_providers=custom_provs,
+        **({"runtime_binding": current_binding} if current_binding is not None else {}))
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
+    binding = parse_runtime_binding(getattr(result, "runtime_binding", None))
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
     if agent:
         _merge_preflight_warning(result, agent, session, cfg, custom_provs)
@@ -375,7 +407,9 @@ def _apply_model_switch(
         session["model_override"] = {
             "model": result.new_model, "provider": result.target_provider,
             "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode,
-            "capabilities": dict(getattr(result, "provider_capabilities", None) or {})}
+            "capabilities": dict(getattr(result, "provider_capabilities", None) or {}),
+            **({"runtime_binding": runtime_binding_state(binding),
+                "requested_provider": binding.requested_provider} if binding else {})}
     if persist_global:
         from hermes_cli.model_switch import persist_model_selection
         persist_model_selection(result)

@@ -25,7 +25,14 @@ from hermes_cli.cli_agent_setup_mixin import _retire_agent
 # new model's effort behind with the old route.
 _RUNTIME_FIELDS = (
     "model", "provider", "requested_provider", "_explicit_api_key", "_explicit_base_url",
-    "api_key", "base_url", "api_mode", "capabilities", "reasoning_config")
+    "api_key", "base_url", "api_mode", "capabilities", "reasoning_config", "runtime_binding")
+
+
+def _binding_switch_kwargs(value) -> dict:
+    """Legacy callers remain additive; present authority is validated, never guessed from keys."""
+    from hermes_cli.runtime_binding import parse_runtime_binding
+    binding = parse_runtime_binding(value)
+    return {"runtime_binding": binding, "requested_provider": binding.requested_provider} if binding else {}
 
 
 def _runtime_fields(cli) -> dict:
@@ -57,9 +64,12 @@ def stored_session_route(session_meta, *, current_model, current_provider):
     from hermes_state import SessionDB as _SessionDB
     runtime = _SessionDB.session_gateway_runtime(session_meta)
     base_url = runtime.get("base_url") or None
-    provider = _heal_bare_custom_provider(runtime.get("provider") or None, base_url=base_url, model=stored_model)
+    from hermes_cli.runtime_binding import parse_runtime_binding
+    binding = parse_runtime_binding(runtime.get("runtime_binding"))
+    provider = binding.requested_provider if binding else _heal_bare_custom_provider(
+        runtime.get("provider") or None, base_url=base_url, model=stored_model)
     provider_changed = bool(provider) and provider != current_provider
-    if stored_model == current_model and not provider_changed:
+    if stored_model == current_model and not provider_changed and binding is None:
         return None
     api_mode = runtime.get("api_mode") or None
     from hermes_cli.runtime_provider import is_foreign_provider_endpoint
@@ -183,7 +193,8 @@ def _switch_model_from(
         current_base_url=cli.base_url or "", current_api_key=cli.api_key or "",
         current_provider_capabilities=getattr(cli, "capabilities", None), is_global=is_global,
         explicit_provider=explicit_provider, user_providers=user_providers,
-        custom_providers=custom_providers)
+        custom_providers=custom_providers,
+        **({"runtime_binding": cli.runtime_binding} if getattr(cli, "runtime_binding", None) is not None else {}))
 
 
 def _run_confirm_and_apply(cli, target, *args) -> None:
@@ -428,8 +439,10 @@ class CLIModelSwitchMixin:
         sid = getattr(self, "session_id", None)
         if not db or not sid:
             return
+        from hermes_cli.runtime_binding import parse_runtime_binding, runtime_binding_state
+        binding = parse_runtime_binding(getattr(result, "runtime_binding", None))
         route = {
-            "provider": _heal_bare_custom_provider(
+            "provider": binding.requested_provider if binding else _heal_bare_custom_provider(
                 result.target_provider, base_url=result.base_url, model=result.new_model,
             ) or None,
             # Both shapes use the same or-None discipline so stale keys from a previous switch are deleted
@@ -440,9 +453,12 @@ class CLIModelSwitchMixin:
             # simplify-code review).
             "base_url": result.base_url or None,
             "api_mode": result.api_mode or None}
+        if binding:
+            route["runtime_binding"] = runtime_binding_state(binding)
         try:
             db.update_session_model(sid, result.new_model)
-            db.patch_session_model_config(sid, {"gateway_runtime": route, **route})
+            db.patch_session_model_config(sid, {"gateway_runtime": route, **route,
+                "runtime_binding": runtime_binding_state(binding)})
         except Exception:
             logger.debug("Failed to persist model switch to session DB", exc_info=True)
 
@@ -457,10 +473,19 @@ class CLIModelSwitchMixin:
         from cli import logger
         if not (session_meta or {}).get("model") or getattr(self, "_explicit_model_override", False):
             return
+        from hermes_state import SessionDB
+        from hermes_cli.runtime_binding import parse_runtime_binding
+        stored_runtime = SessionDB.session_gateway_runtime(session_meta)
+        binding = parse_runtime_binding(stored_runtime.get("runtime_binding"))
+        if binding and binding.credential_policy == "key_override":
+            raise ValueError("Re-supply the original pinned API key before resuming this route")
         route = stored_session_route(session_meta, current_model=self.model, current_provider=self.provider)
         if route is None:
             return
         stored_model, stored_provider, stored_base_url, stored_api_mode, provider_changed = route
+        self.runtime_binding = binding
+        if binding:
+            stored_provider = binding.requested_provider
         from hermes_cli.local_runtime.endpoint import LLAMACPP_ALIASES
         managed = str(stored_provider or "").strip().lower() in LLAMACPP_ALIASES
         self.model = stored_model
@@ -480,7 +505,8 @@ class CLIModelSwitchMixin:
             self._explicit_base_url = None
             try:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
-                resolved = resolve_runtime_provider(requested=stored_provider, target_model=self.model or None)
+                resolved = resolve_runtime_provider(requested=stored_provider, target_model=self.model or None,
+                    **({"runtime_binding": binding, "explicit_base_url": stored_base_url} if binding else {}))
                 if resolved.get("api_key"):
                     self.api_key = resolved["api_key"]
                     self._credential_pool = resolved.get("credential_pool")
@@ -507,7 +533,8 @@ class CLIModelSwitchMixin:
             self._explicit_base_url = stored_base_url
             try:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
-                resolved = resolve_runtime_provider(requested=stored_provider, target_model=self.model or None)
+                resolved = resolve_runtime_provider(requested=stored_provider, target_model=self.model or None,
+                    **({"runtime_binding": binding, "explicit_base_url": stored_base_url} if binding else {}))
                 if resolved.get("api_key"):
                     self.api_key = resolved["api_key"]
                     self._credential_pool = resolved.get("credential_pool")
@@ -538,6 +565,7 @@ class CLIModelSwitchMixin:
                     is_codex_backend=(self.provider or "").strip().lower() == "openai-codex",
                     provider_capabilities=resume_provider_capabilities)
                 self.agent.switch_model(
+                    **_binding_switch_kwargs(getattr(self, "runtime_binding", None)),
                     new_model=self.model, new_provider=self.provider, api_key=self.api_key or "",
                     base_url=self.base_url or "", api_mode=self.api_mode or "",
                     provider_capabilities=resume_provider_capabilities,
@@ -610,9 +638,14 @@ class CLIModelSwitchMixin:
         """Capture current CLI and agent model runtime for one-turn restore."""
         agent = getattr(self, "agent", None)
         # ``reasoning_config`` is a mutable dict: deepcopy it so a later in-place edit cannot alias the snapshot.
+        # An active fallback's live pool does not describe the primary's departure.
         return {
             **_runtime_fields(self),
             "reasoning_config": copy.deepcopy(getattr(self, "reasoning_config", None)),
+            "agent_primary_had_credential_pool": (
+                getattr(agent, "_primary_had_credential_pool", None)
+                if getattr(agent, "_fallback_activated", False)
+                else getattr(agent, "_credential_pool", None) is not None) if agent is not None else None,
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None}
@@ -635,6 +668,8 @@ class CLIModelSwitchMixin:
         if primary and hasattr(agent, "_restore_primary_runtime"):
             try:
                 agent._primary_runtime = copy.deepcopy(primary)
+                if "agent_primary_had_credential_pool" in snapshot:
+                    agent._primary_had_credential_pool = snapshot["agent_primary_had_credential_pool"]
                 agent._fallback_activated = True
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():
@@ -644,6 +679,8 @@ class CLIModelSwitchMixin:
         if hasattr(agent, "switch_model"):
             try:
                 agent.switch_model(
+                    **(_binding_switch_kwargs(snapshot.get("runtime_binding")) or
+                       ({"requested_provider": snapshot["requested_provider"]} if snapshot.get("requested_provider") else {})),
                     new_model=snapshot.get("model", ""), new_provider=snapshot.get("provider", ""),
                     api_key=snapshot.get("api_key", ""), base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
@@ -696,9 +733,11 @@ class CLIModelSwitchMixin:
         """
         from cli import _cprint
         _cli_snapshot = _runtime_fields(self)
+        binding_kwargs = _binding_switch_kwargs(getattr(result, "runtime_binding", None))
+        self.runtime_binding = binding_kwargs.get("runtime_binding")
         self.model = result.new_model
         self.provider = result.target_provider
-        self.requested_provider = result.target_provider
+        self.requested_provider = binding_kwargs.get("requested_provider", result.target_provider)
         # Always overwrite explicit overrides so stale credentials from the previous provider
         # (e.g. Ollama api_key/base_url) don't leak into the next resolution.
         self._explicit_api_key = result.api_key
@@ -714,6 +753,7 @@ class CLIModelSwitchMixin:
         if self.agent is not None:
             try:
                 self.agent.switch_model(
+                    **binding_kwargs,
                     new_model=result.new_model, new_provider=result.target_provider,
                     api_key=result.api_key, base_url=result.base_url, api_mode=result.api_mode,
                     provider_capabilities=getattr(result, "provider_capabilities", None),

@@ -55,6 +55,13 @@ def _compute_host_turn_frame(
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
+    model_override = session.get("model_override")
+    if isinstance(model_override, dict) and "runtime_binding" in model_override:
+        from hermes_cli.runtime_binding import runtime_binding_state
+        model_override = dict(model_override)
+        if model_override["runtime_binding"] is None:
+            raise ValueError("Invalid runtime binding metadata")
+        model_override["runtime_binding"] = runtime_binding_state(model_override["runtime_binding"])
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
@@ -64,7 +71,7 @@ def _compute_host_turn_frame(
         "cwd": _session_cwd(session),
         "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(session),
         "profile_home": session.get("profile_home") or "",
-        "model_override": session.get("model_override"),
+        "model_override": model_override,
         # A model switch queued while the session was busy (config.set model ->
         # pending_model_switch) must cross the process boundary — the live agent is in
         # the compute host, and the server-side _apply_pending_model_switch would
@@ -250,6 +257,9 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
     writer of live agent/history state, and UI reads must not build a second agent."""
     if not isinstance(frame, dict):
         return
+    if "model_override" in frame:
+        from gateway.session import sanitize_model_override
+        session["model_override"] = sanitize_model_override(frame["model_override"])
     with _history_lock(session):
         _compute_host_adopt_frame_meta(session, frame)
         if frame.get("message_count") is not None:

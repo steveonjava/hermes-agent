@@ -976,12 +976,16 @@ def _apply_openai_header_policy(agent, client_kwargs: dict[str, Any]) -> None:
             apply_custom_provider_tls_to_client_kwargs, get_compatible_custom_providers,
             load_config,
         )
-        _cp_entries = get_compatible_custom_providers(load_config())
+        _cp_config = load_config()
+        _cp_entries = get_compatible_custom_providers(_cp_config)
         _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
         apply_custom_provider_tls_to_client_kwargs(client_kwargs, _cp_base_url, _cp_entries)
         # Per-provider extra_headers applied last so the most specific config level wins.
         # SECURITY: values may carry credentials — never log them.
-        apply_custom_provider_extra_headers_to_client_kwargs(client_kwargs, _cp_base_url, _cp_entries)
+        apply_custom_provider_extra_headers_to_client_kwargs(
+            client_kwargs, _cp_base_url, _cp_entries, config=_cp_config,
+            requested_provider=agent.requested_provider or agent.provider,
+        )
     except Exception:
         logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
@@ -2002,6 +2006,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
             custom_providers=_custom_providers,
         )
+    agent.context_compressor.capabilities = dict(getattr(agent, "capabilities", {}) or {})
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         with suppress(Exception):
@@ -2212,6 +2217,7 @@ def _clamp_compressor_to_ollama_num_ctx(agent):
             model=agent.model, context_length=agent._ollama_num_ctx, base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
         )
+        agent.context_compressor.capabilities = dict(getattr(agent, "capabilities", {}) or {})
 
 
 def _emit_compression_summary(agent, cs):
@@ -2266,6 +2272,7 @@ def _snapshot_primary_runtime(agent):
         "model": agent.model,
         "provider": agent.provider,
         "requested_provider": agent.requested_provider,
+        "runtime_binding": getattr(agent, "runtime_binding", None),
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
@@ -2283,6 +2290,7 @@ def _snapshot_primary_runtime(agent):
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
         "compressor_api_key": getattr(_cc, "api_key", ""),
         "compressor_provider": getattr(_cc, "provider", agent.provider),
+        "compressor_api_mode": getattr(_cc, "api_mode", agent.api_mode),
         "compressor_context_length": _cc.context_length,
         "compressor_threshold_tokens": _cc.threshold_tokens,
     }
@@ -2371,8 +2379,18 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
-    tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+    tool_result_metadata_callback: Optional[Callable[..., dict]] = None, runtime_binding=None,
 ):
+    from hermes_cli.runtime_binding import parse_runtime_binding, allows_native_pool
+    agent.runtime_binding = parse_runtime_binding(runtime_binding)
+    if agent.runtime_binding is not None:
+        from hermes_cli.runtime_provider_custom import _validate_runtime_binding
+        _validate_runtime_binding(agent.runtime_binding, provider, requested_provider or provider)
+        requested_provider = agent.runtime_binding.requested_provider
+    if not allows_native_pool(agent.runtime_binding):
+        credential_pool = None
+    if agent.runtime_binding is not None and agent.runtime_binding.credential_policy == "key_override" and not api_key:
+        raise ValueError("Pinned runtime credential unavailable; re-supply the API key")
     _install_safe_stdio()
 
     _params = locals()

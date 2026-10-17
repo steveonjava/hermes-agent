@@ -1386,6 +1386,7 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         preserve_dots=agent._anthropic_preserve_dots(),
         context_length=ctx_len.context_length if ctx_len else None,
         base_url=getattr(agent, "_anthropic_base_url", None),
+        preserve_signed_thinking=(getattr(agent, "capabilities", {}) or {}).get("anthropic_signed_thinking") is True,
         fast_mode=request_overrides.get("speed") == "fast",
         drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)))
     # Portal reads ``tags`` / ``session_id`` on its Messages route too, but the profile hook
@@ -1874,13 +1875,20 @@ def _fallback_api_mode_resolved(agent, fb_provider: str, fb_model: str, fb_base_
     return "chat_completions"
 
 
-def _rebind_fallback_credential_pool(agent, fb_provider: str, fb_model: str) -> None:
+def _rebind_fallback_credential_pool(agent, fb_provider: str, fb_model: str, *, pool_override: bool = False) -> None:
     """Rebind the credential pool when the provider changes (else rate_limit/billing/auth recovery
     mutates the wrong credentials and overwrites the fallback's base_url). Same-provider pool: kept."""
+    from agent.credential_pool import credential_pool_matches_provider, resolve_runtime_pool_key
+    from hermes_cli.runtime_binding import allows_native_pool
+    if pool_override or not allows_native_pool(getattr(agent, "runtime_binding", None)):
+        # Explicit named-route credentials/destination must not rotate back to configured defaults.
+        agent._credential_pool = agent._credential_pool_entry_id = None
+        return
+    base_url = getattr(agent, "base_url", None)
     existing_pool = getattr(agent, "_credential_pool", None)
     if existing_pool is not None:
         pool_provider = (getattr(existing_pool, "provider", "") or "").strip().lower()
-        if pool_provider and pool_provider != fb_provider:
+        if pool_provider and not credential_pool_matches_provider(existing_pool, fb_provider, base_url=base_url):
             logger.info(
                 "Fallback to %s/%s: clearing primary credential pool (pool_provider=%s) to prevent cross-provider contamination",
                 fb_provider, fb_model, pool_provider)
@@ -1888,8 +1896,9 @@ def _rebind_fallback_credential_pool(agent, fb_provider: str, fb_model: str) -> 
     if getattr(agent, "_credential_pool", None) is None:
         try:
             from agent.credential_pool import load_pool
-            fallback_pool = load_pool(fb_provider)
-            if fallback_pool and fallback_pool.has_credentials():
+            fallback_pool = load_pool(resolve_runtime_pool_key(fb_provider, base_url))
+            if (fallback_pool and fallback_pool.has_credentials()
+                    and credential_pool_matches_provider(fallback_pool, fb_provider, base_url=base_url)):
                 agent._credential_pool = fallback_pool
                 logger.info("Fallback to %s/%s: attached fallback credential pool", fb_provider, fb_model)
         except Exception as exc:
@@ -1995,6 +2004,7 @@ def _update_fallback_context_compressor(agent) -> None:
         model=agent.model, context_length=fb_context_length, base_url=agent.base_url,
         api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
     )
+    compressor.capabilities = dict(getattr(agent, "capabilities", {}) or {})
     # Fallback activation is an error path: refresh an EXISTING verdict eagerly (the ceiling was voided by
     # update_model()), but a session that never probed keeps its lazy compaction-time probe rather than
     # resolving an auxiliary client while the primary route is failing (#114707).
@@ -2103,11 +2113,6 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             # short-circuit the fresh fallback before its first stream attempt.
             _reset_stale_streak(agent)
             from agent.native_compaction import resolve_native_compaction_capabilities
-            fallback_capabilities = fb.get("capabilities")
-            agent.capabilities = (
-                {key: value for key, value in fallback_capabilities.items()
-                 if isinstance(key, str) and isinstance(value, bool)}
-                if isinstance(fallback_capabilities, dict) else {})
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider,
                 is_codex_backend=fb_provider == "openai-codex",

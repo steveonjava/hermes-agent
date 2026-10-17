@@ -974,11 +974,13 @@ def _tag(runtime: Optional[dict[str, Any]], requested_provider: str) -> Optional
     return runtime
 
 
-def _named_custom_rung(requested_provider, explicit_api_key, explicit_base_url, target_model) -> Optional[dict[str, Any]]:
+def _named_custom_rung(requested_provider, explicit_api_key, explicit_base_url, target_model, runtime_binding=None) -> Optional[dict[str, Any]]:
     """Rung 3: a configured named custom provider. Honours the ``model.openai_runtime`` opt-in like the
     pool path does for openai/openai-codex (codex resolves the provider from its own config by id)."""
+    from hermes_cli.runtime_binding import allows_native_pool
+    policy_kwargs = {"runtime_binding": runtime_binding} if not allows_native_pool(runtime_binding) else {}
     runtime = _tag(_resolve_named_custom_runtime(requested_provider=requested_provider, explicit_api_key=explicit_api_key,
-                                                explicit_base_url=explicit_base_url, target_model=target_model), requested_provider)
+                                                explicit_base_url=explicit_base_url, target_model=target_model, **policy_kwargs), requested_provider)
     if runtime and runtime.get("provider") == "custom":
         runtime["api_mode"] = _maybe_apply_codex_app_server_runtime(
             provider="custom", api_mode=runtime.get("api_mode") or "chat_completions", model_cfg=_get_model_config(),
@@ -992,7 +994,8 @@ def _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url
 
 
 def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
-                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> dict[str, Any]:
+                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None,
+                             runtime_binding=None) -> dict[str, Any]:
     """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
     rung returns or raises, else falls to the next):
       1. disabled-provider guard (``providers.<name>.enabled: false``)
@@ -1009,7 +1012,16 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
          api_mode to ``codex_app_server``; the rung's credential/endpoint is then not used
     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
     OpenCode Zen/Go where different models route through different API surfaces)."""
+    from hermes_cli.runtime_binding import RuntimeBinding, parse_runtime_binding
+    from hermes_cli.runtime_provider_custom import _binding_identity, _validate_runtime_binding, _get_named_custom_provider as named_entry
+    binding = parse_runtime_binding(runtime_binding)
     requested_provider = resolve_requested_provider(requested)
+    if binding is not None:
+        _validate_runtime_binding(binding, binding.provider, requested_provider)
+        if binding.credential_policy == "key_override" and not explicit_api_key:
+            raise ValueError("Pinned runtime credential unavailable; re-supply the API key")
+    named = named_entry(requested_provider, resolve_credentials=False)
+    policy = ("key_override" if explicit_api_key else "route_override" if named and explicit_base_url else "native")
     _raise_if_provider_disabled(requested_provider)
     # Same alias expansion the auxiliary client applies, so ``provider: openai`` means one thing on
     # every path (background review, curator, MoA slots, delegation) instead of "Unknown provider".
@@ -1018,7 +1030,7 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     requested_alias = requested_provider
     requested_provider, explicit_base_url = expand_direct_api_alias(requested_provider, explicit_base_url)
     _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
-    runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
+    runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model, binding) if r)
     _raise_for_credentialless_bare_custom(requested_provider, runtime)
     # model.openai_runtime is applied ONCE, after the ladder: every rung (pool, OAuth store,
     # explicit --api-key/--base-url, env key) hardcodes the wire api_mode for openai/openai-codex,
@@ -1030,6 +1042,13 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
         logger.info("model.openai_runtime=codex_app_server overrides the %s runtime (source=%s); its credential/endpoint "
                     "is not used — the app-server authenticates with its own login", runtime.get("provider"), runtime.get("source"))
     runtime["api_mode"] = api_mode
+    identity = _binding_identity(requested_alias)[1]
+    if requested_alias == "auto":
+        identity = runtime["provider"]
+        runtime["requested_provider"] = identity
+    runtime["runtime_binding"] = binding or RuntimeBinding(runtime["provider"], identity, policy)
+    from hermes_cli.provider_capabilities import validate_capabilities
+    validate_capabilities(runtime.get("capabilities"), api_mode)
     return runtime
 
 
@@ -1053,11 +1072,11 @@ def _raise_for_credentialless_bare_custom(requested_provider: str, runtime: dict
     )
 
 
-def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model):
+def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model, runtime_binding=None):
     """Ladder rungs 2-8, yielded lazily so each is evaluated only when the previous one returned
     nothing; the last rung (OpenRouter / bare-custom fallback) always yields a runtime."""
     yield _resolve_requested_shortcuts(requested_provider, explicit_api_key, explicit_base_url, target_model)
-    yield _named_custom_rung(requested_provider, explicit_api_key, explicit_base_url, target_model)
+    yield _named_custom_rung(requested_provider, explicit_api_key, explicit_base_url, target_model, runtime_binding)
     # If provider is "auto" (or unset) but config.yaml has an explicit base_url pointing at a custom/local
     # endpoint (e.g. Ollama at localhost:11434), route through the OpenAI-compatible resolver instead of
     # letting resolve_provider() pick up an ANTHROPIC_API_KEY or OPENAI_API_KEY from the environment and
@@ -1069,7 +1088,9 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
                                     explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
                                     target_model=target_model)
-    yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
+    from hermes_cli.runtime_binding import allows_native_pool
+    if allows_native_pool(runtime_binding):
+        yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
     swallowed_auth_error = None
     if provider in _OAUTH_RUNTIME_PROVIDERS:
         try:

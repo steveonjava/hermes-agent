@@ -41,11 +41,36 @@ official repository into a separate namespace, not a fork-created tag. Missing
 or unverifiable baselines fail rather than silently skipping checks. New fork
 size, encoded-command and lint violations remain blocking.
 
+Retained-contract coverage includes trusted Anthropic cache/thinking gates,
+custom-provider migration and fallback identity/capabilities, model switching
+and primary restoration, and Matrix key recovery, sync resilience and SAS.
+Positive opt-in tests run alongside untrusted-route and failure-path controls.
+Before replacing an existing installation, map its staged and unstaged local
+diff to these contracts. A green suite only qualifies the behavior it covers;
+Git ancestry alone does not prove that uncommitted local patches were retained.
+
 Keep `Fork CI` enabled and inherited upstream workflows disabled using GitHub's
 native workflow settings in this fork. Their source files stay intact for future
 upstream merges. This replaces their role in fork acceptance; it does not claim
 that their historical failures passed or requalify the official release.
 The workflow has no source-publishing or deployment credentials and no schedule.
+
+## Capability validation
+
+Generic string-keyed Boolean capability names remain supported. Three explicit
+transport-trust flags receive stricter validation:
+
+- `openai_native_compaction=True` requires `codex_responses`.
+- `anthropic_tool_cache_marker=True` requires `anthropic_messages`.
+- `anthropic_signed_thinking=True` requires `anthropic_messages`.
+
+These flags must be actual Booleans, not truthy strings or numbers. False is
+valid on every transport. Invalid explicit trust raises an error naming the
+flag, without including supplied values or credentials. Provider normalization,
+legacy conversion, model-specific flags and runtime resolution share the checks.
+An explicit fallback transport still wins: incompatible inherited trust is
+disabled while generic capabilities and saved configuration remain unchanged.
+An explicitly supplied invalid fallback opt-in is rejected before agent mutation.
 
 ## Ordinary installations
 

@@ -36,6 +36,7 @@ def _current_runtime(cli) -> dict:
         "api_key": cli.api_key,
         "base_url": cli.base_url,
         "provider": cli.provider,
+        **({"runtime_binding": cli.runtime_binding} if getattr(cli, "runtime_binding", None) is not None else {}),
         "requested_provider": getattr(cli, "requested_provider", cli.provider),
         "api_mode": cli.api_mode,
         "capabilities": dict(getattr(cli, "capabilities", {}) or {}),
@@ -248,10 +249,12 @@ class CLIAgentSetupMixin:
             # sent model cannot use (#112600).
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider, explicit_api_key=self._explicit_api_key,
-                explicit_base_url=self._explicit_base_url, target_model=self.model or None)
+                explicit_base_url=self._explicit_base_url, target_model=self.model or None,
+                **({"runtime_binding": self.runtime_binding} if getattr(self, "runtime_binding", None) is not None else {}))
         except Exception as exc:
             _primary_exc = exc
-        if _primary_exc is not None:
+        from hermes_cli.runtime_binding import allows_credential_refresh
+        if _primary_exc is not None and allows_credential_refresh(getattr(self, "runtime_binding", None)):
             runtime = self._resolve_fallback_runtime(_primary_exc)
             if runtime is not None:
                 _primary_exc = None
@@ -267,6 +270,10 @@ class CLIAgentSetupMixin:
             else:
                 ChatConsole().print(f"[bold red]{message}[/]")
             return False
+        from hermes_cli.runtime_binding import parse_runtime_binding
+        self.runtime_binding = parse_runtime_binding(runtime.get("runtime_binding"))
+        if self.runtime_binding:
+            self.requested_provider = self.runtime_binding.requested_provider
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")
         resolved_provider = runtime.get("provider", "openrouter")
@@ -410,7 +417,8 @@ class CLIAgentSetupMixin:
         try:
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider, explicit_api_key=self._explicit_api_key,
-                explicit_base_url=self._explicit_base_url)
+                explicit_base_url=self._explicit_base_url,
+                **({"runtime_binding": self.runtime_binding} if getattr(self, "runtime_binding", None) is not None else {}))
         except Exception as exc:
             return False, exc
         if not isinstance(runtime, dict):
@@ -654,6 +662,7 @@ class CLIAgentSetupMixin:
             self.agent = AIAgent(
                 model=effective_model, api_key=runtime.get("api_key"),
                 base_url=runtime.get("base_url"), provider=runtime.get("provider"),
+                **({"runtime_binding": runtime["runtime_binding"]} if runtime.get("runtime_binding") is not None else {}),
                 requested_provider=runtime.get("requested_provider"),
                 api_mode=runtime.get("api_mode"), acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"), credential_pool=runtime.get("credential_pool"),
