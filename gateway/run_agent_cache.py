@@ -17,6 +17,7 @@ from gateway.config import Platform
 from gateway.session import SessionSource, build_session_context_prompt
 from gateway.session_prompt_pin import PROMPT_PIN_VERSION, sanitize_prompt_pin
 from gateway.run_shutdown import _log_suppressed
+from hermes_cli.runtime_binding import allows_native_pool, parse_runtime_binding
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli.local_runtime.endpoint import LLAMACPP_ALIASES
 
@@ -155,13 +156,23 @@ class GatewayAgentCacheMixin:
             return
         try:
             persisted = store.get_model_override(session_key)
+        except ValueError:
+            raise
         except Exception:
             logger.debug("Failed to read persisted session model override", exc_info=True)
             return
         if not persisted:
             return
         override: dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
-        provider = persisted.get("provider")
+        binding = parse_runtime_binding(persisted.get("runtime_binding"))
+        if "runtime_binding" in persisted and binding is None:
+            raise ValueError("Invalid runtime binding metadata")
+        if binding is not None:
+            override["runtime_binding"] = persisted["runtime_binding"]
+            override["requested_provider"] = binding.requested_provider
+            if binding.credential_policy == "key_override":
+                raise ValueError("Re-supply the original pinned API key before resuming this route")
+        provider = binding.requested_provider if binding else persisted.get("provider")
         from hermes_cli.runtime_provider import is_foreign_provider_endpoint
         if is_foreign_provider_endpoint(provider, override.get("base_url")):
             override["base_url"] = None  # left over from a switch that kept the previous provider's URL
@@ -170,7 +181,8 @@ class GatewayAgentCacheMixin:
             # since the switch) keep the credential-less override — _resolve_session_agent_runtime
             # retries the resolution for that provider on each turn (default route + notice meanwhile).
             try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider, target_model=persisted.get("model") or None)
+                runtime = _resolve_runtime_agent_kwargs_for_provider(provider, target_model=persisted.get("model") or None,
+                    **({"runtime_binding": binding, "base_url": override.get("base_url")} if binding else {}))
                 for k in ("api_key", "api_mode", "credential_pool", "requested_provider", "max_tokens"):
                     override[k] = runtime.get(k)
                 override["request_overrides"] = dict(runtime.get("request_overrides") or {})
@@ -202,11 +214,23 @@ class GatewayAgentCacheMixin:
         override = self._session_model_override(session_key)
         if not override:
             return model, runtime_kwargs
+        binding = parse_runtime_binding(override.get("runtime_binding"))
+        if "runtime_binding" in override and binding is None:
+            raise ValueError("Invalid runtime binding metadata")
+        if binding and binding.credential_policy == "key_override" and not override.get("api_key"):
+            raise ValueError("Re-supply the original pinned API key before resuming this route")
         model = override.get("model", model)
+        if binding is not None:
+            runtime_kwargs["runtime_binding"] = binding
+            runtime_kwargs["requested_provider"] = binding.requested_provider
+            # A partial override must not inherit the profile's unrelated pool.
+            runtime_kwargs["credential_pool"] = override.get("credential_pool") if allows_native_pool(binding) else None
         for key in _OVERRIDE_APPLY_KEYS:
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        if not allows_native_pool(binding):
+            runtime_kwargs["credential_pool"] = None
         # request_overrides reflects the switched-to provider; apply whenever the override recorded
         # it (even as None) so switching to a provider without configured overrides clears a stale
         # value left by the default provider's runtime resolution.
@@ -217,6 +241,7 @@ class GatewayAgentCacheMixin:
             runtime_kwargs.get("api_key")
             and runtime_kwargs.get("credential_pool") is None
             and override.get("provider")
+            and allows_native_pool(binding)
         ):
             runtime_kwargs["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
         return model, runtime_kwargs

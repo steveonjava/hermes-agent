@@ -459,6 +459,7 @@ class ModelSwitchResult:
     runtime_capabilities: Optional[dict[str, bool]] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+    runtime_binding: object = None
 
 
 @dataclass(frozen=True)
@@ -1116,9 +1117,13 @@ def _apply_direct_alias_endpoint(st: _Switch, da: DirectAlias) -> None:
     resolves for ollama.com, OPENROUTER_API_KEY never reaches an unrelated host)."""
     from hermes_cli.models_local import _same_ollama_native_root
     from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_binding import RuntimeBinding
+    from hermes_cli.runtime_provider_custom import _binding_identity
     alias_key = direct_alias_api_key(da)
     same_host = _may_reuse_session_credential(st.base_url, da.base_url)
     if alias_key:
+        provider, identity = _binding_identity(st.target_provider)
+        st.runtime_binding = RuntimeBinding(provider, identity, "key_override")
         st.base_url, st.api_key = da.base_url, alias_key
     elif st.api_key and st.api_key != "no-key-required" and same_host:
         # Same origin: the key is host-appropriate and re-resolving would only repeat the work.
@@ -1130,6 +1135,7 @@ def _apply_direct_alias_endpoint(st: _Switch, da: DirectAlias) -> None:
                 requested=req, explicit_api_key=explicit, explicit_base_url=da.base_url, target_model=st.new_model)
         except Exception:
             alias_runtime = {}
+        st.runtime_binding = alias_runtime.get("runtime_binding")
         st.base_url = alias_runtime.get("base_url", "") or da.base_url
         # The resolver reports "no key found" as the `no-key-required` placeholder; normalise so
         # a same-host credential still outranks it.
@@ -1175,7 +1181,7 @@ class _Switch:
     current_provider: str
     current_model: str
     current_base_url: str
-    current_api_key: str
+    current_api_key: Any
     is_global: bool
     explicit_provider: str
     user_providers: Optional[dict]
@@ -1192,6 +1198,7 @@ class _Switch:
     provider_capabilities: dict[str, bool] = field(default_factory=dict)
     suppress_ollama_headers: bool = False
     validation: dict = field(default_factory=dict)
+    runtime_binding: object = None
 
     def fail(self, message: str, **fields) -> ModelSwitchResult:
         return ModelSwitchResult(success=False, is_global=self.is_global, error_message=message, **fields)
@@ -1208,7 +1215,20 @@ class _Switch:
         """Fill api_key / base_url / api_mode / validation_headers from ``resolve_runtime_provider``
         for ``new_model``; headers keep their current value when the resolver returns none."""
         from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_binding import RuntimeBinding
+        from hermes_cli.runtime_provider_custom import _binding_identity
+        if "runtime_binding" not in kwargs:
+            provider, identity = _binding_identity(kwargs.get("requested") or self.target_provider)
+            current = self.runtime_binding
+            if current is not None and _binding_identity(current.requested_provider) == (provider, identity):
+                kwargs["runtime_binding"] = current
+                if current.credential_policy == "key_override":
+                    kwargs["explicit_api_key"] = self.current_api_key
+                    kwargs["explicit_base_url"] = self.current_base_url
+            else:
+                kwargs["runtime_binding"] = RuntimeBinding(provider, identity)
         rt = resolve_runtime_provider(target_model=self.new_model, **kwargs)
+        self.runtime_binding = rt.get("runtime_binding")
         self.api_key, self.base_url = rt.get("api_key", ""), rt.get("base_url", "")
         self.api_mode = rt.get("api_mode", "")
         self.validation_headers = rt.get("extra_headers") or self.validation_headers
@@ -1613,6 +1633,11 @@ def _resolve_switch_credentials(st: _Switch) -> Optional[ModelSwitchResult]:
     if mandated_mode is not None and st.api_mode != "codex_app_server":
         st.api_mode = mandated_mode
     st.api_mode = st.api_mode or determine_api_mode(st.target_provider, st.base_url)
+    if st.runtime_binding is None:
+        from hermes_cli.runtime_binding import RuntimeBinding
+        from hermes_cli.runtime_provider_custom import _binding_identity
+        provider, identity = _binding_identity(st.target_provider)
+        st.runtime_binding = RuntimeBinding(provider, identity)
     return None
 
 
@@ -1757,26 +1782,36 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
         provider_capabilities=st.provider_capabilities,
         runtime_capabilities={
             k: v for k, v in runtime_capabilities.items() if isinstance(k, str) and isinstance(v, bool)},
-        model_info=model_info, is_global=st.is_global)
+        model_info=model_info, is_global=st.is_global, runtime_binding=st.runtime_binding)
 
 
 def switch_model(
     raw_input: str, current_provider: str, current_model: str, current_base_url: str = "",
-    current_api_key: str = "", current_provider_capabilities: Optional[dict[str, bool]] = None,
+    current_api_key: Any = "", current_provider_capabilities: Optional[dict[str, bool]] = None,
     is_global: bool = False, explicit_provider: str = "",
-    user_providers: dict | None = None, custom_providers: list | None = None) -> ModelSwitchResult:
+    user_providers: dict | None = None, custom_providers: list | None = None, runtime_binding=None) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
     Route (PATH A with ``--provider``, else PATH B) -> credentials -> validation -> result; each
     step returns a failure :class:`ModelSwitchResult` to stop the chain, or ``None`` to continue.
     ``user_providers`` / ``custom_providers`` are the config.yaml ``providers:`` dict and
     ``custom_providers:`` list."""
+    from hermes_cli.runtime_binding import parse_runtime_binding
+    from hermes_cli.runtime_provider_custom import _binding_identity, _validate_runtime_binding
+    runtime_binding = parse_runtime_binding(runtime_binding)
+    if runtime_binding is not None:
+        canonical, selected = _binding_identity(current_provider)
+        identity = runtime_binding.requested_provider if selected == canonical else current_provider
+        _validate_runtime_binding(runtime_binding, canonical, identity)
+        current_provider = identity
+        if runtime_binding.credential_policy == "key_override" and not current_api_key:
+            raise ValueError("Pinned runtime credential unavailable; re-supply the API key")
     st = _Switch(
         raw_input=raw_input, current_provider=current_provider, current_model=current_model,
         current_base_url=current_base_url, current_api_key=current_api_key,
         current_provider_capabilities=current_provider_capabilities, is_global=is_global,
         explicit_provider=explicit_provider, user_providers=user_providers, custom_providers=custom_providers,
-        new_model=raw_input.strip(), target_provider=current_provider)
+        new_model=raw_input.strip(), target_provider=current_provider, runtime_binding=runtime_binding)
     route = _route_explicit_provider if explicit_provider else _route_from_model_input
     for step in (route, _resolve_switch_credentials, _validate_switch):
         fail = step(st)

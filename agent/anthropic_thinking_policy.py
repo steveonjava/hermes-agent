@@ -82,13 +82,16 @@ _ROUTE_RULES = (
 )
 
 
-def anthropic_thinking_route(base_url: Any, model: Any) -> str:
+def anthropic_thinking_route(base_url: Any, model: Any, *, preserve_signed_thinking: bool = False) -> str:
     """Which thinking-replay contract an Anthropic Messages request follows: ``kimi`` (replay as-is),
     ``deepseek`` (unsigned only), ``native`` (Anthropic-signed blocks: the direct API, Nous Portal,
     Bedrock, Vertex AI, Azure AI Foundry), ``minimax`` (its own signed blocks, returned unchanged on
     every turn as its docs require) or ``third_party`` (an unknown relay that cannot verify Anthropic
-    signatures: strip all). The converter, accounting and signature-rejection state share this."""
-    return next((route for route, matches in _ROUTE_RULES if matches(base_url, model)), "third_party")
+    signatures: strip all). Explicit ``preserve_signed_thinking=True`` grants an unknown relay
+    the native contract without replacing a known platform's policy."""
+    route = next((route for route, matches in _ROUTE_RULES if matches(base_url, model)), "third_party")
+    # Explicit trust grants native signature validation, not Kimi/DeepSeek/MiniMax semantics.
+    return "native" if route == "third_party" and preserve_signed_thinking is True else route
 
 
 def route_replays_prior_thinking(route: str, model: Any) -> bool:
@@ -96,7 +99,11 @@ def route_replays_prior_thinking(route: str, model: Any) -> bool:
     return route == "minimax" or (route == "native" and model_preserves_prior_thinking(model))
 
 
-def native_anthropic_preserves_prior_thinking(base_url: Any, model: Any) -> bool:
+def native_anthropic_preserves_prior_thinking(
+    base_url: Any, model: Any, *, preserve_signed_thinking: bool = False,
+) -> bool:
     """True when the route replays (and the model keeps) signed thinking from earlier turns, so stale
     thinking reaches the wire and accounting must charge the signed carriers."""
-    return route_replays_prior_thinking(anthropic_thinking_route(base_url, model), model)
+    return route_replays_prior_thinking(
+        anthropic_thinking_route(base_url, model, preserve_signed_thinking=preserve_signed_thinking), model
+    )

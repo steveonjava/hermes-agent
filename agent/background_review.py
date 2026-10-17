@@ -251,6 +251,8 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
     parent_api_mode = parent_runtime.get("api_mode") or None
     parent = {
         "provider": agent.provider, "model": agent.model,
+        "requested_provider": parent_runtime.get("requested_provider", getattr(agent, "requested_provider", None)),
+        "runtime_binding": parent_runtime.get("runtime_binding", getattr(agent, "runtime_binding", None)),
         "api_key": parent_runtime.get("api_key") or None, "base_url": parent_runtime.get("base_url") or None,
         "api_mode": "codex_responses" if parent_api_mode == "codex_app_server" else parent_api_mode,
         "credential_pool": getattr(agent, "_credential_pool", None),
@@ -274,7 +276,7 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
         )
         return {
             "provider": rp.get("provider") or task_provider, "model": rp.get("model") or task_model,
-            **{key: rp.get(key) for key in ("api_key", "base_url", "api_mode", "credential_pool", "command")},
+            **{key: rp.get(key) for key in ("api_key", "base_url", "api_mode", "credential_pool", "command", "requested_provider", "runtime_binding")},
             "request_overrides": dict(rp.get("request_overrides") or {}),
             "args": list(rp.get("args") or []), "routed": True,
         }
@@ -920,6 +922,7 @@ def _fork_init_kwargs(agent: Any, rt: dict[str, Any], routed: bool, max_iteratio
     kwargs: dict[str, Any] = {
         "model": rt.get("model") or agent.model, "max_iterations": max_iterations, "quiet_mode": True,
         "platform": agent.platform, "provider": rt.get("provider") or agent.provider,
+        "requested_provider": rt.get("requested_provider"), "runtime_binding": rt.get("runtime_binding"),
         "api_mode": rt.get("api_mode"), "base_url": rt.get("base_url") or None,
         "api_key": rt.get("api_key") or None, "credential_pool": rt.get("credential_pool"),
         "request_overrides": rt.get("request_overrides") or {}, "parent_session_id": agent.session_id,

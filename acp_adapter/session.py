@@ -353,6 +353,12 @@ class SessionManager:
             if isinstance(value, str) and value.strip():
                 session_meta[key] = value.strip()
 
+        from hermes_cli.runtime_binding import parse_runtime_binding, runtime_binding_state
+        binding = parse_runtime_binding(getattr(state.agent, "runtime_binding", None))
+        if binding is not None:
+            session_meta["runtime_binding"] = runtime_binding_state(binding)
+            session_meta["provider"] = binding.requested_provider
+
         try:
             if db.get_session(state.session_id) is None:
                 if not state.history:
@@ -466,6 +472,12 @@ class SessionManager:
                 logger.debug("Failed to reopen ACP session %s", session_id, exc_info=True)
 
         meta = _parse_model_config(row.get("model_config"))
+        from hermes_cli.runtime_binding import parse_runtime_binding
+        binding = parse_runtime_binding(meta.get("runtime_binding"))
+        if "runtime_binding" in meta and binding is None:
+            raise ValueError("Invalid runtime binding")
+        if binding is not None and binding.credential_policy == "key_override":
+            raise ValueError("Re-supply the original API key for this runtime binding")
         cwd, model = meta.get("cwd", "."), row.get("model") or None
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
@@ -479,9 +491,12 @@ class SessionManager:
         try:
             agent = self._make_agent(
                 session_id=session_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
+                **({"runtime_binding": binding} if binding is not None else {}),
                 requested_provider=meta.get("provider") or row.get("billing_provider"),
                 base_url=meta.get("base_url") or row.get("billing_base_url"))
         except Exception:
+            if binding is not None:
+                raise
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None
         state = self._install_state(session_id, agent, cwd, model or getattr(agent, "model", "") or "",
@@ -493,9 +508,14 @@ class SessionManager:
 
     def _make_agent(self, *, session_id: str, cwd: str, model: str | None = None,
                     requested_provider: str | None = None, base_url: str | None = None, api_mode: str | None = None,
-                    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None):
+                    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None,
+                    api_key=None, runtime_binding=None):
         """``enabled_toolsets``/``disabled_toolsets`` carry a live session's toolsets into a rebuild; ``None`` derives
         them from config (fresh session)."""
+        from hermes_cli.runtime_binding import parse_runtime_binding
+        runtime_binding = parse_runtime_binding(runtime_binding)
+        if runtime_binding is not None and runtime_binding.credential_policy == "key_override" and not api_key:
+            raise ValueError("Re-supply the original API key for this runtime binding")
         if self._agent_factory is not None:
             return self._agent_factory()
 
@@ -537,18 +557,25 @@ class SessionManager:
         resolve_error: Exception | None = None
         try:
             runtime = resolve_runtime_provider(
-                requested=requested_provider or config_provider, target_model=(model or default_model) or None)
+                requested=requested_provider or config_provider, target_model=(model or default_model) or None,
+                **({"runtime_binding": runtime_binding, "explicit_api_key": api_key, "explicit_base_url": base_url}
+                   if runtime_binding is not None else {}))
             kwargs.update({
                 "provider": runtime.get("provider"), "api_mode": api_mode or runtime.get("api_mode"),
                 "base_url": base_url or runtime.get("base_url"), "api_key": runtime.get("api_key"),
                 "credential_pool": runtime.get("credential_pool"),
                 "command": runtime.get("command"), "args": list(runtime.get("args") or []),
             })
+            for key in ("requested_provider", "runtime_binding", "capabilities"):
+                if runtime.get(key) is not None:
+                    kwargs[key] = runtime[key]
             # The resolved provider's request body (a custom entry's extra_body); an explicit base_url pointing
             # elsewhere is another endpoint, which must not inherit it.
             if runtime.get("request_overrides") and (not base_url or base_url == runtime.get("base_url")):
                 kwargs["request_overrides"] = runtime["request_overrides"]
         except Exception as exc:
+            if runtime_binding is not None:
+                raise
             resolve_error = exc
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 

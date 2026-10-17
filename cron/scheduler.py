@@ -1825,6 +1825,9 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
 
 
 def _load_credential_pool(runtime: dict, job_id: str):
+    from hermes_cli.runtime_binding import allows_native_pool
+    if not allows_native_pool(runtime.get("runtime_binding")):
+        return None
     runtime_provider = str(runtime.get("provider") or "").strip().lower()
     if not runtime_provider:
         return None
@@ -2471,6 +2474,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         base_url=runtime.get("base_url"),
         provider=runtime.get("provider"),
         requested_provider=runtime.get("requested_provider"),
+        runtime_binding=runtime.get("runtime_binding"),
         api_mode=runtime.get("api_mode"),
         request_overrides=runtime.get("request_overrides"),
         acp_command=runtime.get("command"),

@@ -277,7 +277,7 @@ class AIAgent(
         pass_session_id: bool = False, requested_provider: str | None = None,
         capabilities: dict[str, bool] | None = None, cwd: str | None = None,
         side_agent: bool = False, memory_manager=None,
-        tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+        tool_result_metadata_callback: Optional[Callable[..., dict]] = None, runtime_binding=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent`` (same keyword parameters, minus ``tool_delay``)."""
         init_kwargs = {k: v for k, v in locals().items() if k not in ("self", "tool_delay")}
@@ -462,14 +462,18 @@ class AIAgent(
 
     def switch_model(
         self, new_model, new_provider, api_key="", base_url="", api_mode="",
-        capabilities=None, provider_capabilities=None, runtime_capabilities=None,
+        capabilities=None, provider_capabilities=None, runtime_capabilities=None, requested_provider=None, runtime_binding=None,
     ):
         """Lazily forward a live model switch without erasing its public signature."""
+        identity = {"requested_provider": requested_provider} if requested_provider is not None else {}
+        if runtime_binding is not None:
+            identity["runtime_binding"] = runtime_binding
         return _forward("agent.agent_runtime_helpers", "switch_model")(
             self, new_model, new_provider, api_key, base_url, api_mode,
             capabilities=capabilities,
             provider_capabilities=provider_capabilities,
             runtime_capabilities=runtime_capabilities,
+            **identity,
         )
 
     def _disable_codex_reasoning_replay(

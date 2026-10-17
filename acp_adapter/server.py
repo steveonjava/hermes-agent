@@ -329,11 +329,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         current_provider, current_model = getattr(state.agent, "provider", None), str(state.model or "")
         explicit_provider, model_input = parse_model_input(raw_model, "")
         cfg = load_config()
+        current_api_key = getattr(state.agent, "api_key", "") or ""
+        if not callable(current_api_key):
+            current_api_key = str(current_api_key)
         result = switch_model(
             raw_input=model_input, explicit_provider=explicit_provider,
             current_provider=current_provider or "openrouter", current_model=current_model,
             current_base_url=str(getattr(state.agent, "base_url", "") or ""),
-            current_api_key=str(getattr(state.agent, "api_key", "") or ""),
+            current_api_key=current_api_key,
+            **({"runtime_binding": state.agent.runtime_binding}
+               if getattr(state.agent, "runtime_binding", None) is not None else {}),
             user_providers=cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {},
             custom_providers=get_compatible_custom_providers(cfg))
         if not result.success:
@@ -344,11 +349,24 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             endpoint = {
                 "base_url": getattr(state.agent, "base_url", None), "api_mode": getattr(state.agent, "api_mode", None)
             }
+        from hermes_cli.runtime_binding import RuntimeBinding, parse_runtime_binding
+        from hermes_cli.route_identity import normalize_route_base_url
+        binding = parse_runtime_binding(getattr(result, "runtime_binding", None))
+        if (binding is not None and binding.provider == "custom" and
+                binding.requested_provider.startswith("custom:") and
+                binding.credential_policy != "key_override" and endpoint.get("base_url") and
+                normalize_route_base_url(endpoint["base_url"]) != normalize_route_base_url(result.base_url)):
+            binding = RuntimeBinding(binding.provider, binding.requested_provider, "route_override")
+        authority = {}
+        if binding is not None:
+            authority = {"runtime_binding": binding, "api_key": result.api_key}
+            endpoint.setdefault("base_url", result.base_url)
+            endpoint.setdefault("api_mode", result.api_mode)
         # ACP-provided MCP servers live only on the running agent's toolsets (``_register_session_mcp_servers``);
         # a rebuild that re-derived them from config would silently drop every session MCP tool (#42719).
         agent = self.session_manager._make_agent(
             session_id=state.session_id, cwd=state.cwd, model=new_model,
-            requested_provider=target_provider, **endpoint,
+            requested_provider=binding.requested_provider if binding is not None else target_provider, **endpoint, **authority,
             enabled_toolsets=getattr(state.agent, "enabled_toolsets", None),
             disabled_toolsets=getattr(state.agent, "disabled_toolsets", None),
         )

@@ -72,7 +72,8 @@ def _preflight_request_tokens(
         from agent.anthropic_thinking_policy import native_anthropic_preserves_prior_thinking
 
         if native_anthropic_preserves_prior_thinking(
-            getattr(agent, "base_url", ""), getattr(agent, "model", "")
+            getattr(agent, "base_url", ""), getattr(agent, "model", ""),
+            preserve_signed_thinking=(getattr(agent, "capabilities", {}) or {}).get("anthropic_signed_thinking") is True,
         ):
             from agent.anthropic_thinking_replay import apply_rejected_thinking_suppression
 
@@ -97,6 +98,12 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
     """Whether the active route replays stale thinking text; ``True`` (conservative full
     charge) when route facts are unavailable."""
     try:
+        from agent.anthropic_thinking_policy import native_anthropic_preserves_prior_thinking
+        if getattr(agent, "api_mode", "") == "anthropic_messages" and native_anthropic_preserves_prior_thinking(
+            getattr(agent, "base_url", ""), getattr(agent, "model", ""),
+            preserve_signed_thinking=(getattr(agent, "capabilities", {}) or {}).get("anthropic_signed_thinking") is True,
+        ):
+            return True
         from agent.message_sanitization import stale_thinking_reaches_wire
 
         return stale_thinking_reaches_wire(

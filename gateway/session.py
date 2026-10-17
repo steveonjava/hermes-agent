@@ -467,14 +467,26 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
 
-def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict[str, str]]:
+class InvalidModelOverrideBinding(ValueError):
+    """Present route authority must not be silently discarded by storage recovery."""
+
+
+def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Copy of *override* with only persistable, non-secret keys, or ``None`` when empty."""
     if not isinstance(override, dict):
         return None
-    cleaned = {
+    cleaned: dict[str, Any] = {
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    if "runtime_binding" in override:
+        from hermes_cli.runtime_binding import runtime_binding_state
+        if override["runtime_binding"] is None:
+            raise InvalidModelOverrideBinding("Invalid runtime binding metadata")
+        try:
+            cleaned["runtime_binding"] = runtime_binding_state(override["runtime_binding"])
+        except ValueError:
+            raise InvalidModelOverrideBinding("Invalid runtime binding metadata") from None
     return cleaned or None
 
 
@@ -527,9 +539,9 @@ class SessionEntry:
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
-    # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
-    # sanitize_model_override). Persisted so a restart keeps the chosen model.
-    model_override: Optional[dict[str, str]] = None
+    # Session-scoped route plus validated non-secret binding; never credentials.
+    # sanitize_model_override preserves the selected route across restart.
+    model_override: Optional[dict[str, Any]] = None
     # Profile owning the bot that received this lane's traffic (``RoutingIdentity.transport_profile``,
     # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
     # what says which bot may deliver to it. None = unknown (row predates the field, or standalone).
@@ -1125,7 +1137,7 @@ class SessionStore(
             entry.yolo = enabled
         return self._update_entry(session_key, _apply)
 
-    def get_model_override(self, session_key: str) -> Optional[dict[str, str]]:
+    def get_model_override(self, session_key: str) -> Optional[dict[str, Any]]:
         """Return the persisted /model override for *session_key*, if any."""
         with self._lock:
             entry = self._entry_locked(session_key)

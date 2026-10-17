@@ -366,10 +366,16 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
                 "delegation.base_url: runtime resolution for provider '%s' failed; proceeding without request_overrides: %s",
                 v["provider"], exc,
             )
+    from hermes_cli.runtime_binding import RuntimeBinding
+    from hermes_cli.runtime_provider_custom import _binding_identity
+    canonical, selected = _binding_identity(v["provider"] or provider)
+    policy = "key_override" if v["api_key"] else "route_override" if selected.startswith("custom:") else "native"
+    binding = RuntimeBinding(canonical, selected, policy)
     # api_key None → inherited from parent in _build_child_agent
     return _credential_bundle(
-        v["model"], provider, v["base_url"], v["api_key"], api_mode,
+        v["model"], selected if selected.startswith("custom:") else provider, v["base_url"], v["api_key"], api_mode,
         _merge_request_overrides(request_overrides, explicit_request_overrides),
+        runtime_binding=binding,
     )
 
 def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
@@ -377,7 +383,9 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
     configured_provider = v["provider"]
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"])
+        explicit = {name: v[key] for name, key in (
+            ("explicit_api_key", "api_key"), ("explicit_base_url", "base_url")) if v[key]}
+        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"], **explicit)
     except Exception as exc:
         raise ValueError(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
@@ -416,6 +424,7 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         runtime.get("base_url"), api_key, runtime.get("api_mode"),
         _merge_request_overrides(runtime.get("request_overrides"), explicit_request_overrides) or {},
         command=pinned_command, args=list(runtime.get("args") or []),
+        runtime_binding=runtime.get("runtime_binding"),
     )
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -489,6 +498,7 @@ def _resolve_child_runtime(
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[list[str]],
     routing_cfg: Optional[dict[str, Any]] = None,
+    override_runtime_binding=None,
 ) -> dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -559,10 +569,21 @@ def _resolve_child_runtime(
     # A named provider identity is endpoint-scoped. Preserve it only when the
     # child inherits the exact parent route; an override owns its final identity.
     effective_requested_provider = effective_provider
+    effective_binding = override_runtime_binding
     if not override_provider and not override_base_url and not override_acp_command:
+        effective_binding = vars(parent_agent).get("runtime_binding")
         effective_requested_provider = (
             getattr(parent_agent, "requested_provider", None) or effective_provider
         )
+
+    if effective_binding is not None:
+        from hermes_cli.runtime_binding import parse_runtime_binding
+        effective_binding = parse_runtime_binding(effective_binding)
+        from hermes_cli.runtime_provider_custom import _binding_identity, _validate_runtime_binding
+        canonical, _ = _binding_identity(effective_provider)
+        _validate_runtime_binding(effective_binding, canonical, effective_requested_provider)
+        effective_provider = effective_binding.provider
+        effective_requested_provider = effective_binding.requested_provider
 
     # Reasoning: delegation.reasoning_effort > parent. Keep the raw value — a
     # YAML ``false`` must disable thinking, not coerce to "" and inherit.
@@ -582,6 +603,7 @@ def _resolve_child_runtime(
     kwargs: dict[str, Any] = {
         "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
         "provider": effective_provider, "requested_provider": effective_requested_provider,
+        "runtime_binding": effective_binding,
         "capabilities": _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
         "api_mode": effective_api_mode, "acp_command": effective_acp_command, "acp_args": effective_acp_args,
         "reasoning_config": child_reasoning,

@@ -191,7 +191,14 @@ class GatewayTurnMixin:
             self._rehydrate_session_model_override(skey)
         _override_state = self._peek_session_state(skey) if skey else None
         override = _override_state.conversation.model_override if _override_state else None
+        from hermes_cli.runtime_binding import allows_native_pool, parse_runtime_binding
+        binding = None
         if override:
+            binding = parse_runtime_binding(override.get("runtime_binding"))
+            if "runtime_binding" in override and binding is None:
+                raise ValueError("Invalid runtime binding")
+            if binding is not None and binding.credential_policy == "key_override" and not override.get("api_key"):
+                raise ValueError("Re-supply the original API key for this runtime binding")
             override_model = override.get("model", model)
             override_runtime = {
                 k: override.get(k) for k in (
@@ -199,9 +206,14 @@ class GatewayTurnMixin:
                     "max_tokens", "credential_pool", "request_overrides", "capabilities",
                 )
             }
+            if binding is not None:
+                override_runtime["runtime_binding"] = binding
+                override_runtime["requested_provider"] = binding.requested_provider
+            if not allows_native_pool(binding):
+                override_runtime["credential_pool"] = None
             override_runtime["capabilities"] = dict(override_runtime["capabilities"] or {})
             if override_runtime.get("api_key"):
-                if override_runtime.get("credential_pool") is None:
+                if allows_native_pool(binding) and override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
@@ -229,8 +241,12 @@ class GatewayTurnMixin:
         if override and override.get("provider"):
             try:
                 runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                    override["provider"], target_model=override.get("model") or None)
+                    override["provider"], target_model=override.get("model") or None,
+                    **({"runtime_binding": binding, "base_url": override.get("base_url")}
+                       if binding is not None else {}))
             except Exception as exc:
+                if binding is not None and binding.credential_policy != "native":
+                    raise
                 # Layering the override on the default runtime sent its model to the default provider's
                 # endpoint (openai-codex on the Nous URL). Run this turn on the whole default route and say
                 # so; the persisted override is kept, so the next turn retries it.
@@ -315,7 +331,7 @@ class GatewayTurnMixin:
         runtime = {
             k: runtime_kwargs.get(k) for k in (
                 "api_key", "base_url", "provider", "requested_provider", "api_mode", "command", "args",
-                "credential_pool", "max_tokens", "capabilities",
+                "credential_pool", "max_tokens", "capabilities", "runtime_binding",
             )
         }
         runtime["args"] = list(runtime["args"] or [])
@@ -326,7 +342,7 @@ class GatewayTurnMixin:
             "runtime": runtime,
             "signature": (
                 model, runtime["provider"], runtime["requested_provider"], runtime["base_url"],
-                runtime["api_mode"], runtime["command"], tuple(runtime["args"]),
+                runtime["api_mode"], runtime["command"], tuple(runtime["args"]), runtime["runtime_binding"],
             ),
         }
         tier = getattr(self, "_service_tier", None)

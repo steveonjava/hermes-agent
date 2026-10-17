@@ -17,6 +17,7 @@ def test_switch_preserves_named_provider_capabilities_with_shared_base_url():
         },
         {
             "name": "chatgpt-tier",
+            "api_mode": "codex_responses",
             "base_url": base_url,
             "models": ["gpt-5.6-sol"],
             "capabilities": {"openai_native_compaction": True},

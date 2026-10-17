@@ -1686,7 +1686,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         base_url = api_mode = ""
     # Heal a stale provider persisted by an older build (renamed/removed custom provider → "Unknown provider"):
     # recover ``custom:<name>`` from the stored base_url, then from the entry serving the model; else drop it.
-    if provider and not _is_routable_provider(provider):
+    if provider and "runtime_binding" not in route and not _is_routable_provider(provider):
         healed = None
         try:
             from hermes_cli.runtime_provider import canonical_custom_identity
@@ -1704,6 +1704,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.
         overrides["model_override"] = {
             "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None}
+    if "runtime_binding" in route and "model_override" in overrides:
+        overrides["model_override"]["runtime_binding"] = route["runtime_binding"]
     if provider:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
@@ -1719,9 +1721,17 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     (model column written separately), so a stale provider would route the resumed chat to the wrong endpoint."""
     config = dict(existing or {})
     agent = session_runtime_view(agent)
+    standing = getattr(agent, "_one_turn_runtime_restore", None)
+    if isinstance(standing, dict):
+        from types import SimpleNamespace
+        agent = SimpleNamespace(**standing)
     attr = lambda k: str(getattr(agent, k, "") or "").strip()
     model, provider, base_url = attr("model"), attr("provider"), attr("base_url")
-    if provider.lower() == "custom":
+    from hermes_cli.runtime_binding import parse_runtime_binding, runtime_binding_state
+    binding = parse_runtime_binding(getattr(agent, "runtime_binding", None))
+    if binding is not None:
+        provider = binding.requested_provider
+    if binding is None and provider.lower() == "custom":
         # ``agent.provider`` resolves every named custom entry to the literal "custom", losing the entry
         # identity (api_key is never persisted): recover ``custom:<name>`` from the endpoint URL.
         try:
@@ -1732,6 +1742,7 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     reasoning_config = getattr(agent, "reasoning_config", None)
     live = {
         "model": model, "provider": provider, "base_url": base_url, "api_mode": attr("api_mode"),
+        "runtime_binding": runtime_binding_state(binding),
         # An empty dict is still a real (present) reasoning config.
         "reasoning_config": reasoning_config if isinstance(reasoning_config, dict) else None,
         "service_tier": getattr(agent, "service_tier", None),
@@ -2518,6 +2529,9 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
     try:
         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
     except AuthError as primary_exc:
+        from hermes_cli.runtime_binding import allows_credential_refresh
+        if not allows_credential_refresh((resolve_kwargs or {}).get("runtime_binding")):
+            raise
         for entry in _load_fallback_model() or []:
             fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
             fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""
@@ -2548,12 +2562,23 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
     runtime) wins over global config/env. Older rows stored the resolved provider "custom" (no named entry
     matches) — recover the identity from the persisted base_url or the rebuild fails "No LLM provider
     configured". Persisted base_url/api_key/api_mode are honored only for the original runtime, never a fallback."""
+    from hermes_cli.runtime_binding import parse_runtime_binding, allows_native_pool
+    binding = None
+    if isinstance(model_override, dict) and "runtime_binding" in model_override:
+        binding = parse_runtime_binding(model_override["runtime_binding"])
+        if binding is None:
+            raise ValueError("Invalid runtime binding metadata")
+        if binding.credential_policy == "key_override" and not model_override.get("api_key"):
+            raise ValueError("Re-supply the original pinned API key before resuming this route")
     if isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
-        requested_provider = model_override.get("provider") or provider_override or None
+        requested_provider = binding.requested_provider if binding else model_override.get("provider") or provider_override or None
         override_base_url = model_override.get("base_url")
         resolve_kwargs = {}
-        if str(requested_provider or "").strip().lower() == "custom":
+        if binding:
+            resolve_kwargs.update(runtime_binding=binding, explicit_base_url=override_base_url,
+                                  explicit_api_key=model_override.get("api_key"))
+        if binding is None and str(requested_provider or "").strip().lower() == "custom":
             from hermes_cli.runtime_provider import canonical_custom_identity
             if recovered := canonical_custom_identity(base_url=override_base_url or None, model=model or None):
                 requested_provider = recovered
@@ -2588,6 +2613,11 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
         # Live supervisor beat any persisted loopback URL for this identity.
         overrides.pop("base_url", None)
     resolution.runtime.update({k: v for k, v in overrides.items() if v})
+    if binding:
+        resolution.runtime["runtime_binding"] = binding
+        resolution.runtime["requested_provider"] = binding.requested_provider
+        if not allows_native_pool(binding):
+            resolution.runtime["credential_pool"] = None
     if any(overrides.values()):
         _rederive_per_model_route(model, resolution.runtime)
     return model, resolution.runtime
@@ -2679,6 +2709,7 @@ def _make_agent(
         session = _sessions.get(sid)
     agent = AIAgent(
         model=model, max_iterations=_cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
+        **({"runtime_binding": runtime["runtime_binding"]} if runtime.get("runtime_binding") is not None else {}),
         requested_provider=runtime.get("requested_provider"),
         base_url=runtime.get("base_url"), api_key=runtime.get("api_key"), api_mode=runtime.get("api_mode"),
         capabilities=runtime.get("capabilities"),

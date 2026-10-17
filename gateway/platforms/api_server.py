@@ -288,7 +288,8 @@ _REQUEST_OPTION_MISSING = object()
 # vocabulary clamping happens downstream in agent.reasoning_effort.
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
-    "api_key", "base_url", "provider", "api_mode", "command", "args", "credential_pool")
+    "api_key", "base_url", "provider", "api_mode", "command", "args", "credential_pool",
+    "requested_provider", "runtime_binding")
 
 
 def _clean_request_string(value: Any) -> Optional[str]:
@@ -307,11 +308,32 @@ def _apply_runtime_agent_overrides(
     """Merge resolved provider/runtime fields into ``runtime_kwargs`` in place."""
     if not isinstance(overrides, dict):
         return runtime_kwargs
+    binding = None
+    if "runtime_binding" in overrides:
+        from hermes_cli.runtime_binding import parse_runtime_binding
+        binding = parse_runtime_binding(overrides["runtime_binding"])
+        if binding is None:
+            raise ValueError("Invalid runtime binding metadata")
+    if binding is not None:
+        from hermes_cli.runtime_provider_custom import _validate_runtime_binding
+        _validate_runtime_binding(
+            binding, overrides.get("provider") or binding.provider,
+            overrides.get("requested_provider") or binding.requested_provider)
+        from hermes_cli.runtime_binding import allows_native_pool
+        if not allows_native_pool(binding):
+            runtime_kwargs["credential_pool"] = None
+        if binding.credential_policy == "key_override":
+            runtime_kwargs["api_key"] = overrides.get("api_key")
     for key in _RUNTIME_AGENT_OVERRIDE_KEYS:
         value = overrides.get(key)
         if value is None:
             continue
         runtime_kwargs[key] = list(value) if key == "args" and isinstance(value, (list, tuple)) else value
+    if binding is not None:
+        runtime_kwargs["provider"] = binding.provider
+        runtime_kwargs["requested_provider"] = binding.requested_provider
+        if not allows_native_pool(binding):
+            runtime_kwargs["credential_pool"] = None
     return runtime_kwargs
 
 
@@ -325,7 +347,8 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     return {
-        **{k: runtime.get(k) for k in ("api_key", "base_url", "provider", "api_mode", "command")},
+        **{k: runtime.get(k) for k in ("api_key", "base_url", "provider", "api_mode", "command", "requested_provider")},
+        **({"runtime_binding": runtime["runtime_binding"]} if "runtime_binding" in runtime else {}),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool")}
 
@@ -2323,6 +2346,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 runtime_kwargs["provider"] = effective_provider
             model = effective_model
             # Per-route explicit transport secrets/base URLs win after provider resolution.
+            route_key = _clean_request_string(route_cfg.get("api_key"))
+            route_base = _clean_request_string(route_cfg.get("base_url"))
+            if route_key or route_base:
+                from hermes_cli.runtime_binding import RuntimeBinding, parse_runtime_binding
+                current_binding = parse_runtime_binding(runtime_kwargs.get("runtime_binding"))
+                provider = runtime_kwargs.get("provider") or effective_provider
+                requested = runtime_kwargs.get("requested_provider") or provider
+                named = current_binding is not None and current_binding.requested_provider.startswith("custom:")
+                policy = "key_override" if route_key else (
+                    "route_override" if named else (
+                        current_binding.credential_policy if current_binding else "native"))
+                runtime_kwargs["runtime_binding"] = RuntimeBinding(provider, requested, policy)
+                if policy != "native":
+                    runtime_kwargs["credential_pool"] = None
             for key in ("api_key", "base_url"):
                 value = _clean_request_string(route_cfg.get(key))
                 if value:

@@ -29,6 +29,35 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     # of falling through to OpenRouter defaults.
     base_url_hint = (entry.get("base_url") or "").strip() or None
     api_key_hint = resolve_entry_api_key(entry)
+    requested_provider = provider
+    capabilities = {}
+    pool_override = False
+    from hermes_cli.runtime_binding import RuntimeBinding, parse_runtime_binding
+    binding = parse_runtime_binding(entry.get("runtime_binding"))
+    if binding is not None:
+        from hermes_cli.runtime_provider_custom import _validate_runtime_binding
+        _validate_runtime_binding(binding, binding.provider, requested_provider)
+        if binding.credential_policy == "key_override" and not api_key_hint:
+            raise ValueError("Pinned runtime credential unavailable; re-supply the API key")
+    from hermes_cli.runtime_provider import _get_named_custom_provider, resolve_runtime_provider
+    if _get_named_custom_provider(provider) is not None:
+        pool_override = bool(base_url_hint or api_key_hint)
+        runtime = resolve_runtime_provider(
+            requested=provider, target_model=model or None,
+            explicit_base_url=base_url_hint, explicit_api_key=api_key_hint, runtime_binding=binding,
+        )
+        binding = runtime.get("runtime_binding")
+        requested_provider = runtime.get("requested_provider") or provider
+        provider = runtime["provider"]
+        model = runtime.get("model") or model
+        base_url_hint, api_key_hint = runtime["base_url"], api_key_hint or runtime["api_key"]
+        capabilities = dict(runtime.get("capabilities") or {})
+        if not (entry.get("api_mode") or entry.get("transport")):
+            entry = {**entry, "api_mode": runtime["api_mode"]}
+    from hermes_cli.provider_capabilities import validate_capabilities, TRUST_WIRES
+    explicit_capabilities = "capabilities" in entry
+    if explicit_capabilities:
+        capabilities = validate_capabilities(entry["capabilities"])
     api_mode_explicit, api_mode = _fallback_api_mode_hint(entry, provider, base_url_hint)
     # Ollama Cloud: OLLAMA_API_KEY from env when the entry has no key. Host match, not
     # substring — GHSA-76xc-57q6-vm5m.
@@ -37,10 +66,14 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         api_key_hint = get_secret("OLLAMA_API_KEY") or None
     # raw_codex=True: the main agent needs direct responses.stream() access for Codex providers.
     client, _resolved_model = resolve_provider_client(
-        provider, model=model, raw_codex=True, explicit_base_url=base_url_hint, explicit_api_key=api_key_hint,
+        requested_provider, model=model, raw_codex=True, explicit_base_url=base_url_hint, explicit_api_key=api_key_hint,
         api_mode=api_mode)
     if client is None:
         return None
+    # The named resolver preserves entry headers but wraps Responses for auxiliary calls.
+    from agent.auxiliary_client import CodexAuxiliaryClient
+    if isinstance(client, CodexAuxiliaryClient):
+        client = client._real_client
     if provider == "moa":
         # A MoA entry means the preset itself, exactly like ``provider: moa`` in config. The client
         # is the preset's aggregator and only proves the preset resolves; bind the facade with the
@@ -59,11 +92,23 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         elif not api_mode_explicit and api_mode == "chat_completions":
             api_mode = _fallback_api_mode_resolved(agent, provider, model, base_url)
 
+    if not explicit_capabilities and (entry.get("api_mode") or entry.get("transport")):
+        # A wire-only fallback override wins, but cannot carry inherited trust across wires.
+        capabilities = {
+            flag: False if enabled is True and flag in TRUST_WIRES and TRUST_WIRES[flag] != api_mode else enabled
+            for flag, enabled in capabilities.items()
+        }
+    capabilities = validate_capabilities(capabilities, api_mode)
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+    if not agent._fallback_activated:
+        # Record live provenance before detach; constructor snapshots can predate pool attachment.
+        agent._primary_had_credential_pool = getattr(agent, "_credential_pool", None) is not None
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
     agent._config_context_length = None
-    agent.model, agent.provider, agent.requested_provider = model, provider, provider
+    agent.model, agent.provider, agent.requested_provider = model, provider, requested_provider
+    agent.runtime_binding = binding or RuntimeBinding(provider, requested_provider, "key_override" if api_key_hint and entry.get("api_key") else "native")
+    agent.capabilities = capabilities
     agent.base_url, agent.api_mode = base_url, api_mode
     # reasoning_content echo opt-in travels with the active provider; restore_primary_runtime reverts it.
     agent._reasoning_echo_flag = bool(entry.get("reasoning_echo", False))
@@ -73,7 +118,7 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     reset_codex_reasoning_replay(agent)
     agent._fallback_activated = True
 
-    _rebind_fallback_credential_pool(agent, provider, model)
+    _rebind_fallback_credential_pool(agent, requested_provider, model, pool_override=pool_override)
     if provider == "moa":
         from agent.moa_loop import bind_moa_runtime
         bind_moa_runtime(agent, model)
@@ -118,8 +163,9 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     agent.context_compressor.update_model(
         model=rt["compressor_model"], context_length=rt["compressor_context_length"],
         base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
-        provider=rt["compressor_provider"], api_mode=rt.get("compressor_api_mode", ""),
+        provider=rt["compressor_provider"], api_mode=rt.get("compressor_api_mode", rt["api_mode"]),
     )
+    agent.context_compressor.capabilities = dict(getattr(agent, "capabilities", {}) or {})
     # Same rule as fallback activation: refresh an existing verdict only; never-probed sessions stay lazy.
     if getattr(agent, "_compression_feasibility_checked", False) is True:
         from agent.conversation_compression import revalidate_compression_feasibility

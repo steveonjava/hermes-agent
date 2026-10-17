@@ -88,15 +88,19 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
             explicit_provider=_config_provider or "")
         if not r.success:
             return
+        from hermes_cli.cli_model_switch_mixin import _binding_switch_kwargs
+        binding_kwargs = _binding_switch_kwargs(getattr(r, "runtime_binding", None))
         if cli.agent:
             cli.agent.switch_model(
+                **binding_kwargs,
                 new_model=r.new_model, new_provider=r.target_provider, api_key=r.api_key,
                 base_url=r.base_url, api_mode=r.api_mode,
                 provider_capabilities=getattr(r, "provider_capabilities", None),
                 runtime_capabilities=getattr(r, "runtime_capabilities", None))
         cli.model = r.new_model
         cli.provider = r.target_provider
-        cli.requested_provider = r.target_provider
+        cli.runtime_binding = binding_kwargs.get("runtime_binding")
+        cli.requested_provider = binding_kwargs.get("requested_provider", r.target_provider)
         cli.capabilities = dict(getattr(r, "provider_capabilities", None) or {})
         cli._explicit_api_key = r.api_key
         cli._explicit_base_url = r.base_url

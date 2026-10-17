@@ -2341,6 +2341,7 @@ def _runtime_agent_kwargs(runtime: dict) -> dict:
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
+        **({"runtime_binding": runtime["runtime_binding"]} if runtime.get("runtime_binding") is not None else {}),
         "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
@@ -2444,7 +2445,8 @@ def _resolve_gateway_model_context(
         context_length=context_length, context_source=context_source)
 
 
-def _resolve_runtime_agent_kwargs_for_provider(provider: str, target_model: Optional[str] = None) -> dict:
+def _resolve_runtime_agent_kwargs_for_provider(provider: str, target_model: Optional[str] = None,
+                                               runtime_binding=None, base_url=None) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override).
 
     ``target_model`` is the model the override will actually send: the ladder's model-keyed rungs
@@ -2452,7 +2454,8 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str, target_model: Opti
     resolves an api_mode/base_url the sent model cannot use (#112600)."""
     from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
     try:
-        runtime = resolve_runtime_provider(requested=provider, target_model=target_model or None)
+        runtime = resolve_runtime_provider(requested=provider, target_model=target_model or None,
+            **({"runtime_binding": runtime_binding, "explicit_base_url": base_url} if runtime_binding is not None else {}))
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {

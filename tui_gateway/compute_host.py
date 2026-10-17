@@ -316,6 +316,13 @@ class ComputeHost:
             "session_id": sid, "turn_id": turn_id, "activity_ns": activity_ns}})
 
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
+        override = frame.get("model_override")
+        if isinstance(override, dict) and "runtime_binding" in override:
+            from hermes_cli.runtime_binding import runtime_binding_state
+            if override["runtime_binding"] is None:
+                raise ValueError("Invalid runtime binding metadata")
+            frame = dict(frame)
+            frame["model_override"] = {**override, "runtime_binding": runtime_binding_state(override["runtime_binding"])}
         sid = str(frame.get("sid") or "")
         session = server._sessions.get(sid)
         if session is not None:
@@ -523,7 +530,9 @@ class ComputeHost:
 
 def _history_meta(session: dict) -> dict[str, Any]:
     """Transcript identity for turn.end / control.ack frames; caller holds history_lock."""
+    from gateway.session import sanitize_model_override
     return {
+        **({"model_override": sanitize_model_override(session["model_override"])} if "model_override" in session else {}),
         "session_key": str(session.get("session_key") or ""),
         "history_version": int(session.get("history_version", 0)),
         "message_count": len(session.get("history") or [])}
