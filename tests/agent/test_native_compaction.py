@@ -14,6 +14,7 @@ import pytest
 
 from agent.native_compaction import (
     DEFAULT_COMPACT_THRESHOLD,
+    _gpt_version,
     is_direct_openai_route,
     is_native_compaction_model,
     is_native_compaction_rejection,
@@ -239,6 +240,154 @@ class TestFamilyEligibility:
         assert not is_native_compaction_model(
             "gpt-6-astra-mini", provider="openai-codex", base_url=_CODEX_URL
         )
+
+
+# A dotted minor glued to letters makes the whole token a non-version. These
+# used to read as (major, 0) because the regex dropped the ".minor" group and
+# matched the bare major, which admitted names like Cerebras-GPT-6.7B.
+_DOTTED_MINOR_WITH_SUFFIX = (
+    "gpt-7.1b",
+    "gpt-6.2x",
+    "gpt-9.4beta",
+    "gpt-6.1x",
+    "gpt-10.2mini",
+    "gpt-6.7b",
+    "gpt-5.7x",
+    "gpt-5.1x",
+    "cerebras/Cerebras-GPT-6.7B",
+)
+# Undotted and sub-cutoff-dotted names whose version digits run straight into
+# letters. Only the trailing boundary keeps these from parsing as gpt-<major>
+# or gpt-<major>.<minor>.
+_GLUED_SUFFIX = ("gpt-7b", "gpt-12beta", "gpt-5.59x", "gpt-9x")
+_ROUTE_SAMPLES = (
+    (None, None),
+    ("openai", _API_URL),
+    ("openai-codex", _CODEX_URL),
+    ("openai-codex", "https://relay.example/v1"),
+)
+
+
+class TestVersionTokenBoundaries:
+    @pytest.mark.parametrize("model", _DOTTED_MINOR_WITH_SUFFIX + _GLUED_SUFFIX)
+    def test_version_glued_to_letters_does_not_parse(self, model):
+        assert _gpt_version(model) is None
+        assert not is_native_compaction_model(model)
+
+    @pytest.mark.parametrize(("provider", "base_url", "is_codex"), _APPROVED_ROUTES)
+    @pytest.mark.parametrize("model", _DOTTED_MINOR_WITH_SUFFIX + _GLUED_SUFFIX)
+    def test_glued_version_gets_no_payload_on_approved_routes(
+        self, model, provider, base_url, is_codex
+    ):
+        resolved = resolve_native_compaction_capabilities(
+            model=model, provider=provider, base_url=base_url, is_codex_backend=is_codex
+        )
+        assert resolved == {"native_compaction": False}
+        for runtime in (None, resolved):
+            agent = _routed_agent(model, provider, base_url, runtime)
+            assert (
+                native_compaction_context_management(agent, is_codex_backend=is_codex)
+                is None
+            )
+
+    @pytest.mark.parametrize(
+        ("model", "version"),
+        [
+            ("gpt-6.2.1", (6, 2)),
+            ("gpt-5.6.1", (5, 6)),
+            ("gpt-7.1-b", (7, 1)),
+            ("gpt-7.1", (7, 1)),
+            ("gpt-7", (7, 0)),
+        ],
+    )
+    def test_extra_dotted_part_or_dash_suffix_still_parses(self, model, version):
+        assert _gpt_version(model) == version
+        assert is_native_compaction_model(model)
+
+    def test_trusted_proxy_does_not_send_payload_for_cerebras_gpt(self):
+        # The real Hugging Face name of a 6.7B model, not a GPT release.
+        capabilities = {"openai_native_compaction": True}
+        agent = _agent(
+            model="cerebras/Cerebras-GPT-6.7B",
+            base_url=_PROXY_URL,
+            capabilities=capabilities,
+        )
+        assert (
+            native_compaction_context_management(agent, is_codex_backend=False) is None
+        )
+        # Same proxy, same capability, a genuine dotted version still passes.
+        agent = _agent(model="gpt-6.2.1", base_url=_PROXY_URL, capabilities=capabilities)
+        assert native_compaction_context_management(agent, is_codex_backend=False)
+
+    @pytest.mark.parametrize("model", ["gpt-1234567", "gpt-6.1234567", "gpt-1234567.1"])
+    def test_seven_digit_component_is_not_a_version(self, model):
+        assert _gpt_version(model) is None
+        assert not is_native_compaction_model(model)
+
+    @pytest.mark.parametrize(
+        ("model", "version"),
+        [("gpt-999999", (999999, 0)), ("gpt-5.999999", (5, 999999))],
+    )
+    def test_six_digit_component_still_parses(self, model, version):
+        assert _gpt_version(model) == version
+        assert is_native_compaction_model(model)
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gpt-" + "9" * 5000,
+            "gpt-5." + "9" * 5000,
+            "gpt-6." + "9" * 5000 + "-sol",
+            "gpt-" + "9" * 5000 + ".1",
+        ],
+    )
+    def test_oversized_digit_run_is_rejected_without_raising(self, model):
+        # int() refuses runs past the interpreter's digit limit, so an unbounded
+        # digit class would turn a junk slug into a ValueError on the request path.
+        assert _gpt_version(model) is None
+        assert is_native_compaction_model(model) is False
+        agent = _agent(
+            model=model,
+            base_url=_PROXY_URL,
+            capabilities={"openai_native_compaction": True},
+        )
+        assert (
+            native_compaction_context_management(agent, is_codex_backend=False) is None
+        )
+
+
+class TestAstraTokenBoundary:
+    @pytest.mark.parametrize("model", ["gpt-7-astral", "gpt-7-nastra", "gpt-7-astrao-mini"])
+    @pytest.mark.parametrize(("provider", "base_url"), _ROUTE_SAMPLES)
+    def test_astra_substring_is_decided_by_the_numeric_rule(
+        self, model, provider, base_url
+    ):
+        # "astral" is not the standalone Astra token, so it must not be sent to the
+        # official-OAuth-only Astra gate; GPT 7 is eligible on every route here.
+        assert is_native_compaction_model(model, provider=provider, base_url=base_url)
+
+    def test_astra_substring_gets_payload_on_direct_api(self):
+        resolved = resolve_native_compaction_capabilities(
+            model="gpt-7-astral", provider="openai", base_url=_API_URL
+        )
+        assert resolved == {"native_compaction": True}
+        agent = _routed_agent("gpt-7-astral", "openai", _API_URL, resolved)
+        assert native_compaction_context_management(agent, is_codex_backend=False)
+
+    @pytest.mark.parametrize(
+        "model", ["gpt-7-astra", "gpt-7.1-astra", "openai/gpt-7-astra", "GPT-7-ASTRA"]
+    )
+    @pytest.mark.parametrize(
+        ("provider", "base_url"),
+        [
+            *_ROUTE_SAMPLES,
+            ("openai-codex", "http://chatgpt.com/backend-api/codex"),
+        ],
+    )
+    def test_noncanonical_standalone_astra_is_never_eligible(
+        self, model, provider, base_url
+    ):
+        assert not is_native_compaction_model(model, provider=provider, base_url=base_url)
 
 
 class TestRouteGate:

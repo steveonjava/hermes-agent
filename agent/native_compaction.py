@@ -32,9 +32,11 @@ DEFAULT_COMPACT_THRESHOLD = 200_000
 # Lowest GPT version admitted. Older ones stay out: gpt-5.1/5.2 stall or 500 when the field is present.
 _MIN_GPT_VERSION = (5, 6)
 # ``gpt-<major>[.<minor>]`` as its own token, so dated snapshots and variants (gpt-5.6-mini,
-# gpt-6.1-sol-900k) parse while ``chatgpt-6`` and ``gpt-7b`` do not. The digit cap keeps
-# ``int()`` clear of the interpreter's digit limit on a junk slug.
-_GPT_VERSION_RE = re.compile(r"(?<![a-z0-9])gpt-([0-9]{1,6})(?:\.([0-9]{1,6}))?(?![a-z0-9])")
+# gpt-6.1-sol-900k) parse while ``chatgpt-6`` and ``gpt-7b`` do not. The minor group is
+# possessive (``?+``) so a dotted minor glued to letters (gpt-6.7b) makes the whole token a
+# non-version; without it the regex backtracks to ``gpt-6`` and reads the slug as (6, 0).
+# The digit cap keeps ``int()`` clear of the interpreter's digit limit on a junk slug.
+_GPT_VERSION_RE = re.compile(r"(?<![a-z0-9])gpt-([0-9]{1,6})(?:\.([0-9]{1,6}))?+(?![a-z0-9])")
 _ASTRA_TOKEN_RE = re.compile(r"(?<![a-z0-9])astra(?![a-z0-9])")
 
 
