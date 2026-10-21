@@ -31,7 +31,7 @@ _CODEX = "https://chatgpt.com/backend-api/codex"
     ("gpt-6-astra", "openai-codex", "http://chatgpt.com/backend-api/codex", False),
     ("gpt-6-astra", "openai-codex", None, False),
     ("gpt-6-astra-mini", "openai-codex", _CODEX, False),
-    ("gpt-6-other", "openai-codex", _CODEX, False),
+    ("gpt-6-other", "openai-codex", _CODEX, True),
     ("gpt-5.6", "openai", "https://api.openai.com/v1", True),
     ("gpt-5.6", "openai-codex", _CODEX, True),
 ])

@@ -1,9 +1,11 @@
-"""Tests for native OpenAI Responses server-side compaction (gpt-5.6 only).
+"""Tests for native OpenAI Responses server-side compaction (GPT 5.6 and later).
 
 Live behavior verified 2026-08-08 against api.openai.com: gpt-5.6 and
 gpt-5.3-codex accept ``context_management`` and emit compaction items;
 gpt-5.1/gpt-5.2 fail server-side (HTTP 500 / stream stall) with no
 structured rejection — hence the hard model-family gate these tests pin.
+Versions above 5.6 are admitted on the same footing without having been
+tested individually.
 """
 
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ from agent.native_compaction import (
     is_native_compaction_rejection,
     native_compaction_context_management,
     resolve_compact_threshold,
+    resolve_native_compaction_capabilities,
 )
 
 
@@ -52,6 +55,190 @@ class TestModelGate:
         for model in ("gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-4o", "o3", ""):
             assert not is_native_compaction_model(model)
         assert not is_native_compaction_model(None)
+
+
+_CODEX_URL = "https://chatgpt.com/backend-api/codex"
+_API_URL = "https://api.openai.com/v1"
+_PROXY_URL = "https://trusted-proxy.example/v1"
+
+# GPT versions at or above 5.6, compared numerically as (major, minor) with an
+# omitted minor read as 0. 5.10 and 10 are in here because a string comparison
+# would sort them below 5.6.
+_FAMILY_ELIGIBLE = (
+    "gpt-5.6",
+    "gpt-5.6-mini",
+    "GPT-5.6-2026-07-15",
+    "gpt-5.7",
+    "gpt-5.10",
+    "gpt-5.59",
+    "gpt-6",
+    "gpt-6-2026-09-22",
+    "gpt-6.1",
+    "gpt-6.1-sol",
+    "gpt-6.1-sol-900k",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-7",
+    "gpt-8",
+    "gpt-10",
+    "gpt-10.2",
+    "openai/gpt-5.7",
+    " OpenAI/GPT-7.1-SOL ",
+)
+_FAMILY_INELIGIBLE = (
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5.1",
+    "gpt-5.2",
+    "gpt-5.3-codex",
+    "gpt-5.4",
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-4",
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-3.5-turbo",
+    "o3",
+    "o4-mini",
+    "claude-opus-5.7",
+    "gemini-6",
+    "gpt-oss-120b",
+    "chatgpt-6",
+    "gpt-",
+    "gpt",
+    "",
+    None,
+)
+_APPROVED_ROUTES = [
+    pytest.param("openai-codex", _CODEX_URL, True, id="official-codex"),
+    pytest.param("openai", _API_URL, False, id="direct-openai"),
+]
+
+
+def _routed_agent(model, provider, base_url, runtime_capabilities):
+    return SimpleNamespace(
+        model=model,
+        provider=provider,
+        base_url=base_url,
+        capabilities={},
+        runtime_capabilities=runtime_capabilities,
+        codex_responses_native_compaction=True,
+        compression_enabled=True,
+        codex_responses_compact_threshold=DEFAULT_COMPACT_THRESHOLD,
+        context_compressor=None,
+    )
+
+
+class TestFamilyEligibility:
+    @pytest.mark.parametrize("model", _FAMILY_ELIGIBLE)
+    def test_version_at_or_above_5_6_is_eligible(self, model):
+        assert is_native_compaction_model(model)
+
+    @pytest.mark.parametrize("model", _FAMILY_INELIGIBLE)
+    def test_version_below_5_6_and_non_gpt_names_are_not(self, model):
+        assert not is_native_compaction_model(model)
+
+    @pytest.mark.parametrize(("provider", "base_url", "is_codex"), _APPROVED_ROUTES)
+    @pytest.mark.parametrize("model", _FAMILY_ELIGIBLE)
+    def test_eligible_family_gets_payload_on_approved_routes(
+        self, model, provider, base_url, is_codex
+    ):
+        resolved = resolve_native_compaction_capabilities(
+            model=model, provider=provider, base_url=base_url, is_codex_backend=is_codex
+        )
+        assert resolved == {"native_compaction": True}
+        for runtime in (None, resolved):
+            agent = _routed_agent(model, provider, base_url, runtime)
+            payload = native_compaction_context_management(
+                agent, is_codex_backend=is_codex
+            )
+            assert payload == [
+                {"type": "compaction", "compact_threshold": DEFAULT_COMPACT_THRESHOLD}
+            ]
+
+    @pytest.mark.parametrize(("provider", "base_url", "is_codex"), _APPROVED_ROUTES)
+    @pytest.mark.parametrize("model", _FAMILY_INELIGIBLE)
+    def test_ineligible_family_never_gets_payload_on_approved_routes(
+        self, model, provider, base_url, is_codex
+    ):
+        resolved = resolve_native_compaction_capabilities(
+            model=model, provider=provider, base_url=base_url, is_codex_backend=is_codex
+        )
+        assert resolved == {"native_compaction": False}
+        for runtime in (None, resolved):
+            agent = _routed_agent(model, provider, base_url, runtime)
+            assert (
+                native_compaction_context_management(agent, is_codex_backend=is_codex)
+                is None
+            )
+
+    @pytest.mark.parametrize(
+        ("provider", "base_url"),
+        [
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("custom:local", "http://localhost:1234/v1"),
+            ("custom:untrusted-proxy", _PROXY_URL),
+        ],
+    )
+    @pytest.mark.parametrize("model", ["gpt-5.7", "gpt-6.1-sol", "gpt-10"])
+    def test_newer_family_does_not_widen_route_trust(self, model, provider, base_url):
+        resolved = resolve_native_compaction_capabilities(
+            model=model, provider=provider, base_url=base_url
+        )
+        assert resolved == {"native_compaction": False}
+        for runtime in (None, resolved):
+            agent = _routed_agent(model, provider, base_url, runtime)
+            assert (
+                native_compaction_context_management(agent, is_codex_backend=False)
+                is None
+            )
+
+    @pytest.mark.parametrize("model", ["gpt-5.7", "gpt-6.1-sol-900k", "gpt-10"])
+    def test_trusted_proxy_capability_admits_newer_family(self, model):
+        agent = _agent(
+            model=model,
+            base_url=_PROXY_URL,
+            capabilities={"openai_native_compaction": True},
+        )
+        assert native_compaction_context_management(agent, is_codex_backend=False)
+
+    @pytest.mark.parametrize("model", ["gpt-5.5", "gpt-4o", "o3"])
+    def test_trusted_proxy_capability_does_not_admit_older_models(self, model):
+        agent = _agent(
+            model=model,
+            base_url=_PROXY_URL,
+            capabilities={"openai_native_compaction": True},
+        )
+        assert (
+            native_compaction_context_management(agent, is_codex_backend=False) is None
+        )
+
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-6-astra", "gpt-6-astra-900k", "openai/gpt-6-astra", "gpt-6-astra-mini"],
+    )
+    def test_astra_keeps_its_official_oauth_gate(self, model):
+        # Astra parses as GPT 6, so the numeric rule must not admit it on the
+        # direct API or a relay even though gpt-6.1-sol and gpt-6-luna are admitted.
+        assert not is_native_compaction_model(model)
+        assert not is_native_compaction_model(
+            model, provider="openai", base_url=_API_URL
+        )
+        assert not is_native_compaction_model(
+            model, provider="openai-codex", base_url="https://relay.example/v1"
+        )
+        assert is_native_compaction_model(
+            "gpt-6.1-sol", provider="openai", base_url=_API_URL
+        )
+
+    def test_astra_canonical_ids_still_pass_on_official_oauth(self):
+        for model in ("gpt-6-astra", "gpt-6-astra-900k", "openai/gpt-6-astra"):
+            assert is_native_compaction_model(
+                model, provider="openai-codex", base_url=_CODEX_URL
+            )
+        assert not is_native_compaction_model(
+            "gpt-6-astra-mini", provider="openai-codex", base_url=_CODEX_URL
+        )
 
 
 class TestRouteGate:

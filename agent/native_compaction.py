@@ -2,8 +2,11 @@
 
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` makes the server
 summarize older context into an opaque ``compaction`` item once the input crosses N tokens.
-Deliberately narrow: gpt-5.6 on api.openai.com or the ChatGPT Codex backend, plus gpt-6-astra
-(and its ``-900k`` picker alias) on official Codex OAuth. The local compressor
+Deliberately narrow on routes: GPT 5.6 and later on api.openai.com or the ChatGPT Codex backend
+(plus any route a provider marks as trusted), and gpt-6-astra (and its ``-900k`` picker alias)
+on official Codex OAuth only. Model eligibility is a numeric version compare, so 5.7, 5.10, 6.1
+and later families are admitted without a per-model allowlist. That is a forward-compatibility
+policy, not a claim that every future model was tested. The local compressor
 stays armed as fallback (native threshold clamped below the local trigger); compaction items
 ride the ``codex_reasoning_items`` sidecar. No transport imports (shared gate, no cycles).
 """
@@ -11,6 +14,7 @@ ride the ``codex_reasoning_items`` sidecar. No transport imports (shared gate, n
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -25,20 +29,40 @@ logger = logging.getLogger(__name__)
 LOCAL_TRIGGER_SAFETY_MARGIN = 8_192
 # Fallback when automatic mode has no local trigger to follow.
 DEFAULT_COMPACT_THRESHOLD = 200_000
-# Substring match so dated snapshots and variants (gpt-5.6-mini) stay eligible.
-_ELIGIBLE_MODEL_MARKER = "gpt-5.6"
+# Lowest GPT version admitted. Older ones stay out: gpt-5.1/5.2 stall or 500 when the field is present.
+_MIN_GPT_VERSION = (5, 6)
+# ``gpt-<major>[.<minor>]`` as its own token, so dated snapshots and variants (gpt-5.6-mini,
+# gpt-6.1-sol-900k) parse while ``chatgpt-6`` and ``gpt-7b`` do not. The digit cap keeps
+# ``int()`` clear of the interpreter's digit limit on a junk slug.
+_GPT_VERSION_RE = re.compile(r"(?<![a-z0-9])gpt-([0-9]{1,6})(?:\.([0-9]{1,6}))?(?![a-z0-9])")
+_ASTRA_TOKEN_RE = re.compile(r"(?<![a-z0-9])astra(?![a-z0-9])")
+
+
+def _gpt_version(model: Optional[str]) -> Optional[tuple[int, int]]:
+    """``(major, minor)`` from a GPT slug, minor 0 when absent; None for anything else.
+
+    Compared as integers, so 5.10 sorts above 5.6. A ``vendor/`` prefix does not matter.
+    """
+    match = _GPT_VERSION_RE.search((model or "").strip().lower())
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
 
 
 def is_native_compaction_model(
     model: Optional[str], *, provider: Optional[str] = None, base_url: Optional[str] = None,
 ) -> bool:
-    """Preserve gpt-5.6 eligibility; Astra (``-900k`` is a picker alias of the same wire slug)
-    additionally requires official Codex OAuth."""
-    return _ELIGIBLE_MODEL_MARKER in (model or "").lower() or (
-        is_astra_model(model)
-        and (provider or "").strip().lower() == "openai-codex"
-        and is_official_codex_base_url(base_url or "")
-    )
+    """GPT 5.6 and later by numeric version. Astra (``-900k`` is a picker alias of the same wire
+    slug) parses as GPT 6 but keeps its own gate: it requires official Codex OAuth, and every
+    other Astra variant stays out."""
+    if _ASTRA_TOKEN_RE.search((model or "").lower()):
+        return (
+            is_astra_model(model)
+            and (provider or "").strip().lower() == "openai-codex"
+            and is_official_codex_base_url(base_url or "")
+        )
+    version = _gpt_version(model)
+    return version is not None and version >= _MIN_GPT_VERSION
 
 
 def resolve_native_compaction_capabilities(
